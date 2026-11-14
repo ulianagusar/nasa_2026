@@ -1,16 +1,16 @@
-"""Шари даних Earth Jukebox: будь-яка карта чи крива -> значення в точці -> колір і звук.
+"""Шари даних Earth Jukebox: будь-яка карта -> значення в точці -> колір і звук.
 
-Шар має один інтерфейс:
+Програма працює лише з картами (значення залежить від місця). Шар має один інтерфейс:
     layer.sample(lat, lon, year) -> значення, нормоване значення 0..1 (висота ноти),
                                     "напруга" (наскільки вище/нижче базового рівня: биття,
                                     пульсація), рядки для панелі
-    layer.grid(year)             -> 2D-масив для карти (None для кривої)
+    layer.grid(year)             -> 2D-масив для карти
 
 Звідки беруться шари (автоматично, див. discover_layers):
   * sst.mnmean.nc                       -> "sst": температура поверхні океану (NOAA ERSST v5)
   * data/<назва>/<назва>.meta.json + .u8.bin (або .json з data)  -> карта за роками
-  * data/<назва>/<назва>.json з years/values (без lat/lon)        -> крива (напр. CO2)
   * data/<назва>/jukebox.json (необов'язково) -> назва, кольори, базовий рівень для звуку
+Папки без *.meta.json (напр. криві на кшталт data/co2_curve) пропускаються.
 
 Як додати новий шар - див. LAYERS.md. Конвертер з NetCDF:
     .venv/bin/python layers.py from-netcdf файл.nc --var назва_змінної --name мій_шар
@@ -46,15 +46,22 @@ BUILTIN = {
         "fmt": "{:+.2f}", "default_year": 2025, "tension_scale": 2.0,
         "note": "відносно норми 1951–1980",
     },
-    "co2_curve": {
-        "title": "CO₂ в атмосфері",
-        "fmt": "{:.1f}", "default_year": 2025, "cmap": "blues",
-        "baseline": 280.0, "base_label": "доіндустріальний рівень", "tension_scale": 170.0,
-        "note": "однаково для всієї планети",
+    "ocean_sst_video": {
+        "title": "Температура океану з відео NASA (ECCO2)",
+        "fmt": "{:.1f}", "cmap": "sequential", "default_frame": 0,
+        "baseline": "mean", "base_label": "середнє за рік у цій точці", "tension_scale": 4.0,
+        "missing_label": "суша / немає кольору", "note": "оцінка за кольором відео; дати кадрів приблизні",
+    },
+    "ocean_flow_activity": {
+        "title": "Активність течій з відео NASA (0–1)",
+        "units": "", "fmt": "{:.2f}", "cmap": "blues", "default_frame": 0,
+        "missing_label": "суша / немає ліній",
+        "note": "візуальний показник густоти ліній, не швидкість; дати кадрів приблизні",
     },
 }
 CFG_KEYS = ("title", "units", "source", "description", "note", "fmt", "vmin", "vmax", "cmap", "baseline",
-            "base_label", "tension_scale", "default_year", "missing_label", "static_label")
+            "base_label", "tension_scale", "default_year", "default_frame", "missing_label", "static_label",
+            "partial_years", "prefer")
 
 
 def wrap180(lon):
@@ -110,7 +117,6 @@ def _unit_short(units):
 # ----------------------------------------------------------------------------
 class Layer:
     """Спільна логіка: форматування, нормування для висоти ноти, "напруга" для биття/пульсу."""
-    spatial = True
 
     def __init__(self, name, cfg):
         self.name, self.cfg = name, cfg
@@ -124,39 +130,62 @@ class Layer:
         diverging = self.vmin < 0 < self.vmax
         self.cmap = cfg.get("cmap") or ("diverging" if diverging else "sequential")
         self.lut = make_lut(self.cmap)
-        self.baseline = cfg.get("baseline", 0.0 if diverging else None)
+        b = cfg.get("baseline", 0.0 if diverging else None)
+        self.baseline = None if isinstance(b, str) else b      # "mean" обробляє GridLayer (сітка середніх)
         self.base_label = cfg.get("base_label", "базовий рівень")
         self.tension_scale = float(cfg.get("tension_scale") or
                                    (max(abs(self.vmin), abs(self.vmax)) if diverging else (self.vmax - self.vmin) / 2))
         self.missing_label = cfg.get("missing_label", "немає даних")
-        self.years = None
-        self.partial_years = set()
+        self.partial_years = {int(y) for y in cfg.get("partial_years", [])}   # напр. поточний рік
+        # Час: шар = послідовність кадрів. times - момент кожного кадру в роках (2007.24 = кінець березня 2007),
+        # labels - підпис кадру ("1990" або "28.03.2007"). None = один момент часу.
+        self.times, self.labels, self.has_dates = None, [], False
 
-    # --- час ---
-    def default_year(self):
-        if self.years is None:
-            return None
+    # --- час: індекс кадру t = 0..n_frames-1 ---
+    @property
+    def n_frames(self):
+        return 1 if self.times is None else len(self.times)
+
+    @property
+    def dynamic(self):
+        return self.n_frames > 1
+
+    def default_frame(self):
+        if not self.dynamic:
+            return 0
+        if self.cfg.get("default_frame") is not None:
+            return self.clamp_frame(int(self.cfg["default_frame"]))
         y = self.cfg.get("default_year")
-        if y is not None and self.years[0] <= y <= self.years[-1]:
-            return int(y)
-        full = [y for y in self.years if y not in self.partial_years]
-        return int(full[-1] if full else self.years[-1])
+        if y is not None:
+            cand = [i for i, t in enumerate(self.times) if int(t) == int(y)]
+            if cand:
+                return cand[-1]
+        full = [i for i, t in enumerate(self.times) if int(t) not in self.partial_years]
+        return full[-1] if full else self.n_frames - 1
 
-    def clamp_year(self, year):
-        if self.years is None:
-            return None
-        if year is None:
-            return self.default_year()
-        return int(np.clip(year, self.years[0], self.years[-1]))
+    def clamp_frame(self, t):
+        return self.default_frame() if t is None else int(np.clip(t, 0, self.n_frames - 1))
 
-    def year_index(self, year):
-        return 0 if self.years is None else int(np.argmin(np.abs(self.years - self.clamp_year(year))))
+    def frame_at(self, when):
+        """Найближчий кадр до моменту when (у роках, напр. 1990.5); для перемикання шарів без втрати часу."""
+        if not self.dynamic or when is None:
+            return self.default_frame()
+        return int(np.argmin(np.abs(np.asarray(self.times) - when)))
 
-    def time_label(self, year):
-        if self.years is None:
+    def time_of(self, t):
+        return None if not self.dynamic else float(self.times[self.clamp_frame(t)])
+
+    def time_label(self, t):
+        if not self.dynamic:
             return self.cfg.get("static_label", "")
-        y = int(self.years[self.year_index(year)])
-        return f"{y} (неповний рік)" if y in self.partial_years else str(y)
+        k = self.clamp_frame(t)
+        lab = self.labels[k]
+        return f"{lab} (неповний рік)" if int(self.times[k]) in self.partial_years else lab
+
+    def short_label(self, t):
+        """Короткий підпис для шкали часу: "1990" або "03.2007"."""
+        lab = self.labels[self.clamp_frame(t)]
+        return lab[3:] if self.has_dates else lab
 
     # --- значення ---
     def fmt_value(self, v, clipped=0):
@@ -193,39 +222,51 @@ class Layer:
 
 
 class GridLayer(Layer):
-    """Карта на регулярній сітці: frames[рік][широта зростає][довгота -180..180]."""
+    """Карта на регулярній сітці: data[кадр][широта зростає][довгота -180..180].
 
-    def __init__(self, name, cfg, lat, lon, frames, years=None, baseline_grid=None, clipped=None, search_cells=3):
-        lat, lon, frames = np.asarray(lat, float), np.asarray(lon, float), np.asarray(frames, np.float32)
+    times/labels: момент (у роках) і підпис кожного кадру; None = один момент часу.
+    cfg["baseline"] = "mean" -> базовий рівень кожної клітинки = її середнє за всі кадри."""
+
+    def __init__(self, name, cfg, lat, lon, data, times=None, labels=None, baseline_grid=None, clipped=None,
+                 search_cells=3, has_dates=False):
+        lat, lon, data = np.asarray(lat, float), np.asarray(lon, float), np.asarray(data, np.float32)
         if lat[0] > lat[-1]:                                   # широти: з півдня на північ
-            lat, frames = lat[::-1], frames[:, ::-1]
+            lat, data = lat[::-1], data[:, ::-1]
             baseline_grid = None if baseline_grid is None else baseline_grid[::-1]
             clipped = None if clipped is None else clipped[:, ::-1]
         lon_w = wrap180(lon)                                   # довготи: -180..180 за зростанням
         order = np.argsort(lon_w)
-        lon, frames = lon_w[order], frames[:, :, order]
+        lon, data = lon_w[order], data[:, :, order]
         baseline_grid = None if baseline_grid is None else baseline_grid[:, order]
         clipped = None if clipped is None else clipped[:, :, order]
         cfg = dict(cfg)
         if "vmin" not in cfg:
-            cfg["vmin"], cfg["vmax"] = float(np.nanpercentile(frames, 1)), float(np.nanpercentile(frames, 99))
+            cfg["vmin"], cfg["vmax"] = float(np.nanpercentile(data, 1)), float(np.nanpercentile(data, 99))
+        if cfg.get("baseline") == "mean" and baseline_grid is None:
+            import warnings
+            with warnings.catch_warnings():                    # клітинки, де даних немає в жодному кадрі
+                warnings.simplefilter("ignore", RuntimeWarning)
+                baseline_grid = np.nanmean(data, axis=0)
         super().__init__(name, cfg)
-        self.lat, self.lon, self.frames = lat, lon, frames
-        self.years = None if years is None else np.asarray(years, int)
+        self.lat, self.lon, self.data = lat, lon, data
+        if times is not None and len(times) > 1:
+            self.times = np.asarray(times, float)
+            self.labels = list(labels) if labels is not None else [str(int(t)) for t in times]
+            self.has_dates = has_dates
         self.baseline_grid = baseline_grid
         self.clipped = clipped
         self.search_cells = search_cells
 
-    def grid(self, year):
-        return self.frames[self.year_index(year)]
+    def grid(self, t):
+        return self.data[self.clamp_frame(t)]
 
     def extent(self):
         dlat = abs(self.lat[1] - self.lat[0]); dlon = abs(self.lon[1] - self.lon[0])
         return (self.lon[0] - dlon / 2, self.lon[-1] + dlon / 2, self.lat[0] - dlat / 2, self.lat[-1] + dlat / 2)
 
-    def sample(self, lat, lon, year=None):
-        g = self.grid(year)
-        k = self.year_index(year)
+    def sample(self, lat, lon, t=None):
+        g = self.grid(t)
+        k = self.clamp_frame(t)
         i = int(np.argmin(np.abs(self.lat - lat)))
         j = int(np.argmin(np.abs(wrap180(self.lon - lon))))
         near = 0.0
@@ -242,6 +283,8 @@ class GridLayer(Layer):
                 return self._missing()
             near, i, j = best
         base = self.baseline_grid[i, j] if self.baseline_grid is not None else self.baseline
+        if base is not None and np.isnan(base):
+            base = None
         clip = 0 if self.clipped is None else int(self.clipped[k, i, j])
         extra = [(f"{self.missing_label}: найближче значення ~{near:.0f} км", "ink2")] if near else []
         return self._result(float(g[i, j]), None if base is None else float(base), clip, near, extra)
@@ -257,57 +300,42 @@ class GridLayer(Layer):
         cfg.update(BUILTIN.get(folder.name, {}))
         cfg.update(_folder_overrides(folder))
         cfg.update(overrides or {})
-        years, lat, lon = meta.get("years"), meta["lat"], meta["lon"]
-        shape = (len(years) if years else 1, len(lat), len(lon))
-        u8 = folder / f"{name}.u8.bin"
+        years, dates, lat, lon = meta.get("years"), meta.get("dates"), meta["lat"], meta["lon"]
+        n = len(dates) if dates else (len(years) if years else 1)
+        shape = (n, len(lat), len(lon))
+        if dates:     # кадри з датами (напр. тижні): years тоді лише рік кожного кадру
+            times = [_decimal_year(d) for d in dates]
+            labels = [f"{d[8:10]}.{d[5:7]}.{d[:4]}" for d in dates]
+        elif years:
+            times, labels = [y + 0.5 for y in years], [str(y) for y in years]
+        else:
+            times = labels = None
+        u8, js = folder / f"{name}.u8.bin", folder / f"{name}.json"
+        # Повний .json точніший (без квантування і без обрізання за vmin/vmax), тож беремо його, якщо він
+        # не завеликий для швидкого старту; інакше компактний .u8.bin. Можна задати в jukebox.json: "prefer".
+        prefer = cfg.get("prefer") or ("json" if js.exists() and js.stat().st_size < 20_000_000 else "u8")
         clipped = None
-        if u8.exists():
+        if u8.exists() and (prefer == "u8" or not js.exists()):
             b = np.fromfile(u8, np.uint8).reshape(shape)
             vmin, vmax = float(meta["vmin"]), float(meta["vmax"])
-            frames = np.where(b == 255, np.nan, vmin + b.astype(np.float32) / 254 * (vmax - vmin)).astype(np.float32)
+            data = np.where(b == 255, np.nan, vmin + b.astype(np.float32) / 254 * (vmax - vmin)).astype(np.float32)
             clipped = np.where(b == 254, 1, np.where(b == 0, -1, 0)).astype(np.int8)  # значення на межі шкали
         else:
-            data = json.loads((folder / f"{name}.json").read_text())["data"]
-            frames = np.array([[[np.nan if v is None else v for v in row] for row in fr] for fr in
-                               (data if years else [data])], np.float32)
-        return cls(folder.name, cfg, lat, lon, frames, years, clipped=clipped)
+            raw = json.loads(js.read_text())["data"]
+            data = np.array(raw, dtype=np.float32)                 # null -> NaN
+            if data.ndim == 2:
+                data = data[None]
+        lay = cls(folder.name, cfg, lat, lon, data, times, labels, clipped=clipped, has_dates=bool(dates))
+        lay.storage = "u8" if clipped is not None else "json"
+        return lay
 
 
-class CurveLayer(Layer):
-    """Одне значення на рік для всієї планети (напр. CO2). Місце пальця не важливе, важливий рік."""
-    spatial = False
-
-    def __init__(self, name, cfg, years, values, monthly=None):
-        values = np.asarray(values, float)
-        cfg = dict(cfg)
-        if "vmin" not in cfg:
-            pad = 0.02 * (values.max() - values.min())
-            cfg["vmin"], cfg["vmax"] = float(values.min() - pad), float(values.max() + pad)
-        super().__init__(name, cfg)
-        self.years, self.values, self.monthly = np.asarray(years, int), values, monthly
-        if monthly:
-            ys = np.asarray(monthly["year"])
-            self.partial_years = {int(y) for y in np.unique(ys) if (ys == y).sum() < 12}
-
-    def grid(self, year):
-        return None
-
-    def sample(self, lat=0.0, lon=0.0, year=None):
-        k = self.year_index(year)
-        return self._result(float(self.values[k]), None if self.baseline is None else float(self.baseline))
-
-    @classmethod
-    def from_folder(cls, folder, overrides=None):
-        folder = Path(folder)
-        path = folder / f"{folder.name}.json"
-        if not path.exists():
-            path = next(p for p in folder.glob("*.json") if p.name != "jukebox.json")
-        d = json.loads(path.read_text())
-        cfg = {k: d[k] for k in CFG_KEYS if k in d}
-        cfg.update(BUILTIN.get(folder.name, {}))
-        cfg.update(_folder_overrides(folder))
-        cfg.update(overrides or {})
-        return cls(folder.name, cfg, d["years"], d["values"], d.get("monthly"))
+def _decimal_year(date):
+    """'2007-03-28' -> 2007.236 (середина дня в частках року)."""
+    from datetime import date as _d
+    y, m, d = int(date[:4]), int(date[5:7]), int(date[8:10])
+    doy = (_d(y, m, d) - _d(y, 1, 1)).days
+    return y + (doy + 0.5) / (366 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 365)
 
 
 def load_sst_layer(path=SST_FILE, month=None):
@@ -327,7 +355,7 @@ def load_sst_layer(path=SST_FILE, month=None):
            "fmt": "{:.1f}", "vmin": -2.0, "vmax": 32.0, "cmap": "sequential",
            "base_label": "норма 1971–2000", "tension_scale": 2.5, "missing_label": "суша",
            "static_label": f"{MONTHS_UA[m - 1]} {date[:4]}"}
-    return GridLayer("sst", cfg, lat, lon, cur[None], None, baseline_grid=base)
+    return GridLayer("sst", cfg, lat, lon, cur[None], baseline_grid=base)
 
 
 def _folder_overrides(folder):
@@ -361,14 +389,6 @@ def discover_layers(month=None, data_dir=DATA_DIR, sst_file=SST_FILE):
             meta = json.loads(metas[0].read_text())
             title = ov.get("title") or BUILTIN.get(folder.name, {}).get("title") or meta.get("description") or folder.name
             specs.append(LayerSpec(folder.name, title, "карта", lambda f=folder: GridLayer.from_folder(f)))
-            continue
-        jsons = [p for p in folder.glob("*.json") if p.name != "jukebox.json" and p.stat().st_size < 20_000_000]
-        for p in jsons:
-            d = json.loads(p.read_text())
-            if isinstance(d, dict) and "years" in d and "values" in d and "lat" not in d:
-                title = ov.get("title") or BUILTIN.get(folder.name, {}).get("title") or d.get("layer") or folder.name
-                specs.append(LayerSpec(folder.name, title, "крива", lambda f=folder: CurveLayer.from_folder(f)))
-                break
     return specs
 
 
@@ -443,70 +463,18 @@ class LayerView:
         self._colorbar(d, img, layer, y1 + 32)
         return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR), ext
 
-    def _base_curve(self, layer):
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-        from matplotlib.figure import Figure
-        fig = Figure(figsize=(self.W / 100, self.H / 100), dpi=100, facecolor=SURFACE)
-        canvas = FigureCanvasAgg(fig)
-        ax = fig.add_axes([0.08, 0.1, 0.89, 0.76])
-        ax.set_facecolor(SURFACE)
-        if layer.monthly:
-            mo = layer.monthly
-            t = np.array(mo["year"]) + (np.array(mo["month"]) - 0.5) / 12
-            ax.plot(t, mo[[k for k in mo if k not in ("year", "month")][0]], color=CMAPS["blues"][1], lw=1)
-        full = np.array([y not in layer.partial_years for y in layer.years])
-        ax.plot(layer.years[full] + 0.5, layer.values[full], color=CMAPS["blues"][3], lw=2)
-        if layer.baseline is not None:
-            ax.axhline(layer.baseline, color=GRIDC, lw=1, ls="--")
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
-        for s in ("left", "bottom"):
-            ax.spines[s].set_color(GRIDC)
-        ax.tick_params(colors=MUTED, labelsize=9)
-        ax.grid(axis="y", color=GRIDC, lw=0.6)
-        ax.set_ylabel(layer.unit, color=INK2)
-        canvas.draw()
-        img = cv2.cvtColor(np.asarray(canvas.buffer_rgba()), cv2.COLOR_RGBA2BGR)
-        H = img.shape[0]
-        tr = ax.transData
-
-        def to_px(year, value):
-            x, y = tr.transform((year + 0.5, value))
-            return int(x), int(H - y)
-        (_, ytop), (_, ybot) = tr.transform([(0, ax.get_ylim()[1]), (0, ax.get_ylim()[0])])
-        return img, to_px, (int(H - ytop), int(H - ybot))
-
-    def render(self, layer, year, pos=None, trail=(), dwell=0.0, label=None):
-        if layer.spatial:
-            key = (layer.name, layer.year_index(year))
-            if key not in self.cache:
-                self.cache[key] = self._base_map(layer, year)
-            base, ext = self.cache[key]
-            img = base.copy()
-            pts = [tuple(int(v) for v in self._px(la, lo, ext)) for la, lo in trail]
-            for (a, b), (c, e) in zip(pts, pts[1:]):
-                if abs(c - a) < (self.MAP[2] - self.MAP[0]) / 4:   # не через лінію зміни дат
-                    cv2.line(img, (a, b), (c, e), (120, 120, 120), 2, cv2.LINE_AA)
-            if pos is not None:
-                self._marker(img, tuple(int(v) for v in self._px(pos[0], pos[1], ext)), dwell, label)
-            return img
-        key = (layer.name, "curve")
+    def render(self, layer, t, pos=None, trail=(), dwell=0.0, label=None):
+        key = (layer.name, layer.clamp_frame(t))
         if key not in self.cache:
-            from PIL import Image
-            img, to_px, yr = self._base_curve(layer)
-            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            self.cache[key] = (pil, to_px, yr)
-        pil, to_px, (ytop, ybot) = self.cache[key]
-        from PIL import ImageDraw
-        frame = pil.copy()
-        d = ImageDraw.Draw(frame)
-        d.rectangle([0, 0, self.W, 62], fill=hex_rgb(SURFACE))
-        self._header(d, layer, year)
-        img = cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR)
-        k = layer.year_index(year)
-        p = to_px(int(layer.years[k]), float(layer.values[k]))
-        cv2.line(img, (p[0], ytop), (p[0], ybot), (200, 200, 200), 1, cv2.LINE_AA)
-        self._marker(img, p, dwell, label)
+            self.cache[key] = self._base_map(layer, t)
+        base, ext = self.cache[key]
+        img = base.copy()
+        pts = [tuple(int(v) for v in self._px(la, lo, ext)) for la, lo in trail]
+        for (a, b), (c, e) in zip(pts, pts[1:]):
+            if abs(c - a) < (self.MAP[2] - self.MAP[0]) / 4:   # не через лінію зміни дат
+                cv2.line(img, (a, b), (c, e), (120, 120, 120), 2, cv2.LINE_AA)
+        if pos is not None:
+            self._marker(img, tuple(int(v) for v in self._px(pos[0], pos[1], ext)), dwell, label)
         return img
 
     @staticmethod
@@ -528,8 +496,10 @@ class LayerView:
 # Експорт: будь-який масив/NetCDF -> папка шару у форматі Earth Jukebox
 # ----------------------------------------------------------------------------
 def write_layer(out_dir, name, years, lat, lon, data, units="", title="", source="", vmin=None, vmax=None,
-                diverging=False, extra_cfg=None):
-    """data: [роки][широта][довгота] (NaN = немає даних). Пише <name>.meta.json, <name>.u8.bin, jukebox.json."""
+                diverging=False, extra_cfg=None, dates=None):
+    """data: [кадр][широта][довгота] (NaN = немає даних); years - рік кожного кадру (None = один момент);
+    dates - необов'язкові дати кадрів 'РРРР-ММ-ДД' (для помісячних/тижневих даних).
+    Пише <name>.meta.json, <name>.u8.bin, jukebox.json."""
     data = np.asarray(data, np.float32)
     if vmin is None or vmax is None:
         if diverging:
@@ -544,6 +514,8 @@ def write_layer(out_dir, name, years, lat, lon, data, units="", title="", source
             "years": None if years is None else [int(y) for y in years],
             "lat": [float(v) for v in lat], "lon": [float(v) for v in lon], "axis_order": "[year][lat][lon]",
             "vmin": float(vmin), "vmax": float(vmax), "null_meaning": "no data"}
+    if dates is not None:
+        meta["dates"] = [str(d)[:10] for d in dates]
     (folder / f"{name}.meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
     cfg = {"title": title or name, "units": units, "source": source}
     cfg.update(extra_cfg or {})
@@ -571,15 +543,16 @@ def netcdf_to_layer(nc_path, var, name, out_dir=DATA_DIR, title="", units=None, 
     for d in list(da.dims):                                    # зайві виміри (рівень, ансамбль) -> перший індекс
         if d not in ("time", "lat", "lon"):
             da = da.isel({d: level})
-    years = None
+    years = dates = None
     if "time" in da.dims:
         if annual:
             da = da.groupby("time.year").mean("time")
             years = da["year"].values
             da = da.transpose("year", "lat", "lon")
-        else:
+        else:                                                  # кожен крок часу - окремий кадр з датою
             da = da.transpose("time", "lat", "lon")
-            years = np.arange(da.sizes["time"])
+            dates = [str(t)[:10] for t in da["time"].values]
+            years = [int(d[:4]) for d in dates]
         data = da.values
     else:
         data = da.transpose("lat", "lon").values[None]
@@ -592,7 +565,7 @@ def netcdf_to_layer(nc_path, var, name, out_dir=DATA_DIR, title="", units=None, 
     return write_layer(out_dir, name, years, lat, lon, data, units=units,
                        title=title or str(da.attrs.get("long_name", name)),
                        source=source or str(ds.attrs.get("title", ds.attrs.get("dataset_title", ""))),
-                       diverging=diverging)
+                       diverging=diverging, dates=dates)
 
 
 def _cli():
@@ -602,15 +575,16 @@ def _cli():
     p = sub.add_parser("from-netcdf", help="перетворити NetCDF на шар у data/<name>/")
     p.add_argument("nc"); p.add_argument("--var", required=True); p.add_argument("--name", required=True)
     p.add_argument("--title", default=""); p.add_argument("--units"); p.add_argument("--source", default="")
-    p.add_argument("--monthly", action="store_true", help="не усереднювати по роках (кожен крок часу = 'рік' 0,1,2..)")
+    p.add_argument("--monthly", action="store_true", help="не усереднювати по роках: кожен крок часу - окремий кадр з датою")
     p.add_argument("--diverging", action="store_true", help="симетрична шкала навколо 0 (для аномалій)")
     p.add_argument("--out", default=str(DATA_DIR))
     a = ap.parse_args()
     if a.cmd == "list":
         for k, s in enumerate(discover_layers(), 1):
             lay = s.load()
-            yrs = "статичний" if lay.years is None else f"{lay.years[0]}–{lay.years[-1]}"
-            print(f"{k}. {s.name:14s} [{s.kind}] {s.title} | {lay.units} | {yrs}")
+            when = (lay.time_label(0) or "один момент") if not lay.dynamic else \
+                f"{lay.labels[0]} … {lay.labels[-1]} ({lay.n_frames} кадрів)"
+            print(f"{k}. {s.name:20s} {s.title} | {lay.units} | {when}")
     else:
         f = netcdf_to_layer(a.nc, a.var, a.name, a.out, a.title, a.units, a.source, not a.monthly, a.diverging)
         print(f"Готово: {f}  (з'явиться в finger_map.py автоматично, якщо --out = data/)")

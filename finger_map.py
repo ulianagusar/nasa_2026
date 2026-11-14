@@ -1,7 +1,9 @@
-"""Палець на паперовій карті -> значення обраного шару даних (температура океану,
-аномалія температури, CO2, ... - див. LAYERS.md) -> панель, карта і звук.
+"""Палець на паперовій карті -> значення обраного шару-карти (температура океану,
+аномалія температури, ... - див. LAYERS.md) -> панель, карта і звук.
 
-Шари: клавіші l / 1-9 у вікні; для шарів з роками , . (±1 рік), < > (±10), p (відтворення).
+Дві руки: ПРАВИЙ вказівний палець водить по карті, ЛІВИЙ вказівний палець задає рік -
+його положення вздовж карти (лівий край аркуша = перший рік, правий = останній).
+Шари: клавіші l / 1-9; рік також , . (±1), < > (±10), p (відтворення); h - поміняти руки.
 
 Камера дивиться на роздруковану карту світу. Програма:
   * відстежує карту за її власним малюнком (ORB-точки + гомографія), без фізичних
@@ -565,9 +567,8 @@ def capture_template(cap, corners):
 ROLE_COLORS = {"ink": INK, "ink2": INK2, "muted": MUTED, "warm": WARM, "cool": COOL}
 
 
-def report(layer, year, lat, lon, s):
-    where = "вся планета" if not layer.spatial else L.fmt_coord(lat, lon)
-    head = f"[{datetime.now():%H:%M:%S}] {where} · {layer.title}, {layer.time_label(year)}"
+def report(layer, t, lat, lon, s):
+    head = f"[{datetime.now():%H:%M:%S}] {L.fmt_coord(lat, lon)} · {layer.title}, {layer.time_label(t)}"
     if s is None or s["missing"]:
         return f"{head} -> {layer.missing_label}"
     extra = [t for t, role in s["lines"] if role in ("ink2", "warm", "cool")]
@@ -613,26 +614,29 @@ class Panel:
         d.text((x, y), f"ШАР {info['layer_idx']}/{n}  ·  l або 1–{min(n, 9)}: змінити", font=self.f["xs"],
                fill=col("muted")); y += 20
         y = self._text(d, x, y, layer.title, self.f["l"], "ink", W, 22)
-        if layer.years is not None:
-            d.text((x, y), f"рік {layer.time_label(info['year'])}" + ("   ▶ відтворення" if info.get("playing") else ""),
-                   font=self.f["s"], fill=col("ink2")); y += 22
-            d.text((x, y), ", .  рік ±1    < >  ±10    p  ▶/❚❚", font=self.f["xs"], fill=col("muted")); y += 20
+        if layer.dynamic:
+            mode = ("   ✋ ліва рука" if info.get("time_hand") else "   ▶ відтворення" if info.get("playing") else "")
+            k = layer.clamp_frame(info["t"])
+            d.text((x, y), f"{'дата' if layer.has_dates else 'рік'} {layer.time_label(k)}" + mode, font=self.f["s"],
+                   fill=col("cool" if info.get("time_hand") else "ink2")); y += 22
+            d.text((x, y), f"ліва рука вздовж карти: {layer.short_label(0)} ← → {layer.short_label(layer.n_frames - 1)}",
+                   font=self.f["xs"], fill=col("muted")); y += 17
+            d.text((x, y), f"кадр {k + 1}/{layer.n_frames}   , . ±1   < > ±10   p ▶/❚❚", font=self.f["xs"],
+                   fill=col("muted")); y += 20
         else:
-            d.text((x, y), layer.time_label(None), font=self.f["s"], fill=col("ink2")); y += 22
+            d.text((x, y), layer.time_label(None) + " (один момент часу)", font=self.f["s"], fill=col("ink2")); y += 22
         y += 4
         d.line([(x, y), (self.w - 20, y)], fill=L.hex_rgb(GRIDC)); y += 10
 
-        if not layer.spatial:
-            d.text((x, y), "ВСЯ ПЛАНЕТА (від місця не залежить)", font=self.f["xs"], fill=col("muted")); y += 22
-        else:
-            d.text((x, y), "ПІД ПАЛЬЦЕМ", font=self.f["xs"], fill=col("muted")); y += 20
-            if info.get("pos"):
-                d.text((x, y), L.fmt_coord(*info["pos"]), font=self.f["m"], fill=col("ink")); y += 28
+        d.text((x, y), "ПІД ПРАВИМ ПАЛЬЦЕМ", font=self.f["xs"], fill=col("muted")); y += 20
+        if info.get("pos"):
+            d.text((x, y), L.fmt_coord(*info["pos"]), font=self.f["m"], fill=col("ink")); y += 28
         if s is not None:
             if s["missing"]:
                 d.text((x, y), layer.missing_label, font=self.f["xl"], fill=col("ink2")); y += 60
             else:
-                d.text((x, y), s["text"], font=self.f["xl"], fill=col("ink")); y += 60
+                big = self.f["xl"] if d.textlength(s["text"], font=self.f["xl"]) <= W else self.f["m"]
+                d.text((x, y), s["text"], font=big, fill=col("ink")); y += 60 if big is self.f["xl"] else 32
                 for t, role in s["lines"]:
                     small = role == "muted"
                     y = self._text(d, x, y, t, self.f["xs"] if small else self.f["s"], role, W, 18 if small else 22)
@@ -671,7 +675,7 @@ class Panel:
         if info.get("last_fix"):
             d.text((x, y), "Остання фіксація:", font=self.f["xs"], fill=col("muted")); y += 18
             self._text(d, x, y, info["last_fix"], self.f["xs"], "ink", W, 17, max_lines=4)
-        d.text((x, height - 24), "q вихід · c калібр. · k кути · m звук", font=self.f["xs"], fill=col("muted"))
+        d.text((x, height - 24), "q вихід · c калібр. · k кути · m звук · h руки", font=self.f["xs"], fill=col("muted"))
         return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
 
 
@@ -818,29 +822,96 @@ def make_landmarker():
     import mediapipe as mp
     from mediapipe.tasks.python import BaseOptions, vision
     opts = vision.HandLandmarkerOptions(base_options=BaseOptions(model_asset_path=str(MODEL_FILE)),
-                                        running_mode=vision.RunningMode.VIDEO, num_hands=1,
+                                        running_mode=vision.RunningMode.VIDEO, num_hands=2,
                                         min_hand_detection_confidence=0.5, min_tracking_confidence=0.5)
     return mp, vision.HandLandmarker.create_from_options(opts)
+
+
+def hand_roles(res, swap=False):
+    """Результат MediaPipe -> {"map": кисть правої руки, "time": кисть лівої}.
+
+    MediaPipe позначає руки так, ніби кадр дзеркальний (селфі-камера). Наш кадр звичайний,
+    тому мітки "Left"/"Right" міняємо місцями; swap=True (клавіша h) міняє ще раз.
+    Якщо обидві руки отримали однакову мітку, розводимо за положенням: лівіша в кадрі = ліва."""
+    hands = []
+    for lms, hd in zip(res.hand_landmarks, res.handedness):
+        label = hd[0].category_name
+        if not swap:
+            label = "Right" if label == "Left" else "Left"
+        hands.append([label, lms])
+    if len(hands) == 2 and hands[0][0] == hands[1][0]:
+        hands.sort(key=lambda h: h[1][0].x)                    # 0 = зап'ястя
+        hands[0][0], hands[1][0] = "Left", "Right"
+    return {("map" if label == "Right" else "time"): lms for label, lms in hands}
+
+
+def frame_from_u(layer, u, current, hysteresis=0.6):
+    """Положення лівого пальця вздовж карти (u: 0 = лівий край аркуша, 1 = правий) -> кадр шару
+    (рік, тиждень, ... - скільки кадрів є). Гістерезис: кадр змінюється, лише коли палець відійшов
+    більш ніж на 0.6 кадру, щоб не мерехтіло."""
+    last = layer.n_frames - 1
+    cont = float(np.clip(u, 0, 1)) * last
+    if current is None or abs(cont - current) > hysteresis:
+        return int(np.clip(round(cont), 0, last))
+    return current
+
+
+def _timeline_ticks(layer, max_labels=7):
+    """Кадри з позначками на шкалі: круглі роки для річних шарів, рівномірно - для шарів з датами."""
+    n = layer.n_frames
+    if not layer.has_dates:
+        y0, y1 = int(layer.times[0]), int(layer.times[-1])
+        step = next(s for s in (1, 2, 5, 10, 20, 25, 50, 100) if (y1 - y0) / s <= max_labels * 2)
+        ticks = [layer.frame_at(y + 0.5) for y in range((y0 // step + 1) * step, y1, step)]
+        return [(k, layer.short_label(k), (int(layer.times[k]) // step) % 2 == 0) for k in ticks]
+    ticks = np.unique(np.round(np.linspace(0, n - 1, max_labels)).astype(int))
+    return [(int(k), layer.short_label(int(k)), True) for k in ticks]
+
+
+def draw_timeline(frame, G, layer, t, active):
+    """Шкала часу вздовж нижнього краю аркуша (там, де її "читає" ліва рука)."""
+    Ginv = np.linalg.inv(G)
+    last = max(layer.n_frames - 1, 1)
+    col = (191, 106, 37) if active else (170, 170, 170)        # BGR: синій, коли ліва рука керує
+    a, b = apply_H(Ginv, [[0.0, 1.04], [1.0, 1.04]])
+    cv2.line(frame, tuple(np.int32(a)), tuple(np.int32(b)), col, 2, cv2.LINE_AA)
+    for k, lab, show in _timeline_ticks(layer):
+        p = apply_H(Ginv, [[k / last, 1.04]])[0]
+        q = apply_H(Ginv, [[k / last, 1.07]])[0]
+        cv2.line(frame, tuple(np.int32(p)), tuple(np.int32(q)), col, 1, cv2.LINE_AA)
+        if show:
+            cv2.putText(frame, lab, (int(q[0]) - 4 * len(lab), int(q[1]) + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col,
+                        1, cv2.LINE_AA)
+    k = layer.clamp_frame(t)
+    c = apply_H(Ginv, [[k / last, 1.04]])[0]
+    cv2.circle(frame, tuple(np.int32(c)), 8, col, -1, cv2.LINE_AA)
+    lab = layer.labels[k]
+    cv2.putText(frame, lab, (int(c[0]) - 7 * len(lab), int(c[1]) - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2,
+                cv2.LINE_AA)
 
 
 def run_tracking(cap, cal, specs, args, scale):
     mp, landmarker = make_landmarker()
     frame = _read(cap)
     tracker = make_tracker(args.track, cal, frame.shape)
-    finger = OneEuro()
+    finger, time_finger = OneEuro(), OneEuro(min_cutoff=0.8)
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
     panel, view = Panel(340), L.LayerView()
     names = [s.name for s in specs]
     li = names.index(args.layer) if args.layer in names else 0
     layer = specs[li].load()
-    year = layer.clamp_year(args.year)
+    t = layer.frame_at(None if args.year is None else args.year + 0.5)   # індекс кадру шару
     playing, last_step = False, 0.0
+    swap = args.swap_hands
 
     print("=== ТРЕКІНГ === Шари даних:")
     for k, s in enumerate(specs, 1):
-        print(f"   {k}. {s.title} [{s.kind}]" + ("   <- зараз" if k - 1 == li else ""))
-    print("   Клавіші у вікні: l / 1-9 - шар, , . - рік ±1, < > - ±10, p - відтворення років,")
-    print(f"   m - звук, q - вихід, c - калібрування, k - кути. Палець {args.dwell:.0f} с на місці -> запис сюди.")
+        print(f"   {k}. {s.title}" + ("   <- зараз" if k - 1 == li else ""))
+    print("   ПРАВА рука, вказівний палець: водити по карті.")
+    print("   ЛІВА рука, вказівний палець: час - вести вздовж карти (лівий край = перший кадр, правий = останній).")
+    print("   Клавіші у вікні: l / 1-9 - шар, , . - кадр ±1, < > - ±10, p - відтворення,")
+    print("   h - поміняти руки, m - звук, q - вихід, c - калібрування, k - кути.")
+    print(f"   Правий палець {args.dwell:.0f} с на місці -> запис сюди.")
     if son.stream is not None:
         print("   Звук: висота = значення шару (пентатоніка), биття і пульсація = наскільки вище базового")
         print("   рівня (норми), ліво/право = довгота, шум = немає даних, дзвіночок = фіксація.\n")
@@ -849,17 +920,18 @@ def run_tracking(cap, cal, specs, args, scale):
     cv2.namedWindow(WIN_SST, cv2.WINDOW_NORMAL)
     placed = False
     smooth, anchor, anchor_t, fired, last_seen = None, None, 0.0, False, 0.0
+    tsmooth, time_seen = None, 0.0
     trail = deque(maxlen=40)
     last_fix = ""
     t0, last_ts = time.monotonic(), -1
 
     def switch(new_li):
-        nonlocal li, layer, year
+        nonlocal li, layer, t
         li = new_li % len(specs)
         print(f"Шар {li + 1}/{len(specs)}: {specs[li].title} (завантаження...)")
-        prev_year = year
+        when = layer.time_of(t)                                # той самий момент часу в новому шарі
         layer = specs[li].load()
-        year = layer.clamp_year(prev_year)
+        t = layer.frame_at(when)
         trail.clear()
 
     while True:
@@ -867,26 +939,50 @@ def run_tracking(cap, cal, specs, args, scale):
         h, w = frame.shape[:2]
         now = time.monotonic()
         ts = max(int((now - t0) * 1000), last_ts + 1); last_ts = ts
-        if playing and layer.years is not None and now - last_step >= args.step:
-            last_step = now
-            year = year + 1 if year < layer.years[-1] else int(layer.years[0])
 
         corners = tracker.update(frame)
         G = cam_to_sheet_H(corners)
 
         res = landmarker.detect_for_video(
             mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), ts)
-        if res.hand_landmarks:
-            lm = res.hand_landmarks[0][INDEX_TIP]
+        roles = hand_roles(res, swap) if res.hand_landmarks else {}
+
+        # ---- права рука: точка на карті ----
+        if "map" in roles:
+            lm = roles["map"][INDEX_TIP]
             smooth = finger(np.array([lm.x * w, lm.y * h]), now).copy()
             last_seen = now
         elif now - last_seen > 0.4:  # руку загублено
             smooth, anchor, fired = None, None, False
             finger.reset()
 
+        # ---- ліва рука: час ----
+        time_hand = False
+        if "time" in roles:
+            lm = roles["time"][INDEX_TIP]
+            tsmooth = time_finger(np.array([lm.x * w, lm.y * h]), now).copy()
+            time_seen = now
+        elif now - time_seen > 0.4:
+            tsmooth = None
+            time_finger.reset()
+        if tsmooth is not None:
+            tu, tv = apply_H(G, [tsmooth])[0]
+            near_sheet = -0.15 <= tu <= 1.15 and -0.3 <= tv <= 1.4
+            if layer.dynamic and near_sheet:
+                t = frame_from_u(layer, tu, t)
+                time_hand, playing = True, False
+            c = (int(tsmooth[0]), int(tsmooth[1]))
+            cv2.circle(frame, c, 9, (191, 106, 37) if time_hand else (150, 150, 150), -1, cv2.LINE_AA)
+            cv2.putText(frame, "TIME", (c[0] + 12, c[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (191, 106, 37) if time_hand else (150, 150, 150), 2, cv2.LINE_AA)
+
+        if playing and layer.dynamic and now - last_step >= args.step:
+            last_step = now
+            t = t + 1 if t < layer.n_frames - 1 else 0
+
         info = {"state": "nohand", "sheet": tracker.status, "dwell": 0.0, "last_fix": last_fix,
                 "inliers": getattr(tracker, "inliers", None), "layer": layer, "layer_idx": li + 1,
-                "n_layers": len(specs), "year": year, "playing": playing}
+                "n_layers": len(specs), "t": t, "playing": playing, "time_hand": time_hand}
         lat = lon = None
         frac = 0.0
         if smooth is not None:
@@ -907,30 +1003,27 @@ def run_tracking(cap, cal, specs, args, scale):
             c = (int(smooth[0]), int(smooth[1]))
             cv2.circle(frame, c, 7, col, -1)
             cv2.ellipse(frame, c, (24, 24), -90, 0, 360 * frac, col, 3)
+            cv2.putText(frame, "MAP", (c[0] + 26, c[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
 
-        if layer.spatial:
-            s = layer.sample(lat, lon, year) if lat is not None else None
-        else:
-            s = layer.sample(0.0, 0.0, year)                   # крива: значення однакове для всієї планети
+        s = layer.sample(lat, lon, t) if lat is not None else None
         info["sample"] = s
 
         if smooth is not None and frac >= 1.0 and not fired:
             fired = True
             if s is not None:
-                last_fix = report(layer, year, lat, lon, s)
+                last_fix = report(layer, t, lat, lon, s)
                 print(last_fix)
                 son.chime()
             else:
                 print(f"[{datetime.now():%H:%M:%S}] палець поза картою")
 
         # ---- звук ----
-        pan_lon = lon if lon is not None else 0.0
         if s is None:
             son.silence()
         elif s["missing"]:
-            son.missing(pan_lon)
+            son.missing(lon)
         else:
-            son.play(s["norm"], s["tension"], pan_lon, quiet=bool(s["near_km"]))
+            son.play(s["norm"], s["tension"], lon, quiet=bool(s["near_km"]))
         info["note"] = None if son.note is None else f"{midi_name(son.note)} · {midi_to_hz(son.note):.0f} Гц"
         info["muted"] = son.muted or son.stream is None
 
@@ -938,6 +1031,8 @@ def run_tracking(cap, cal, specs, args, scale):
         cv2.polylines(frame, [np.int32(corners)], True, qcol[tracker.status], 2)
         for p in corners:
             cv2.circle(frame, (int(p[0]), int(p[1])), 6, qcol[tracker.status], -1)
+        if layer.dynamic:
+            draw_timeline(frame, G, layer, t, time_hand)
 
         cam = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         ph = max(cam.shape[0], 700)
@@ -946,8 +1041,7 @@ def run_tracking(cap, cal, specs, args, scale):
         cv2.imshow(WIN_CAM, np.hstack([cam, panel.render(ph, info)]))
         label = None if s is None else (layer.missing_label if s["missing"] else s["text"])
         pos = (lat, lon) if lat is not None else None
-        map_img = view.render(layer, year, pos, trail if layer.spatial else (),
-                              frac if (pos is not None or not layer.spatial) and smooth is not None else 0.0, label)
+        map_img = view.render(layer, t, pos, trail, frac if pos is not None else 0.0, label)
         cv2.imshow(WIN_SST, map_img)
         if not placed:
             cv2.moveWindow(WIN_CAM, 0, 0)
@@ -960,18 +1054,23 @@ def run_tracking(cap, cal, specs, args, scale):
             break
         if key == ord("m"):
             print("Звук вимкнено" if son.toggle_mute() else "Звук увімкнено")
+        if key == ord("h"):
+            swap = not swap
+            print("Руки поміняно місцями: тепер " + ("ліва водить по карті, права керує часом" if swap
+                                                     else "права водить по карті, ліва керує часом")
+                  + " (за мітками MediaPipe).")
         if key == ord("l"):
             switch(li + 1)
         if ord("1") <= key <= ord("9") and key - ord("1") < len(specs):
             switch(key - ord("1"))
-        if layer.years is not None:
+        if layer.dynamic:
             step = {ord(","): -1, ord("."): 1, ord("<"): -10, ord(">"): 10}.get(key)
             if step:
-                year = layer.clamp_year(year + step)
+                t = layer.clamp_frame(t + step)
             if key == ord("p"):
                 playing = not playing
                 last_step = now
-                print("Відтворення років: " + ("▶" if playing else "пауза"))
+                print("Відтворення кадрів: " + ("▶" if playing else "пауза"))
         if key == ord("c"):
             son.silence()
             cal = run_calibration(cap, args, scale)
@@ -1135,10 +1234,11 @@ def selftest(args):
     print(f"\n4) Шари даних ({len(specs)}), значення біля Одеси (46.5°N, 30.7°E):")
     for s in specs:
         lay = by[s.name]
-        y = lay.default_year()
-        smp = lay.sample(46.48, 30.73, y)
-        print(f"   {s.name:12s} [{s.kind}] {lay.title}, {lay.time_label(y)}: {smp['text']}  "
-              f"(висота {smp['norm']:.2f}, напруга {smp['tension']:+.2f})")
+        k_ = lay.default_frame()
+        smp = lay.sample(46.48, 30.73, k_)
+        frames_ = f"{lay.n_frames} кадр." if lay.dynamic else "1 момент"
+        txt = "немає даних поблизу" if smp["missing"] else f"{smp['text']}  (висота {smp['norm']:.2f}, напруга {smp['tension']:+.2f})"
+        print(f"   {s.name:20s} {frames_:>10s}, {lay.time_label(k_)}: {txt}")
     if "sst" in by:                       # звірка з NetCDF напряму
         import xarray as xr
         ds = xr.open_dataset(L.SST_FILE, engine="h5netcdf")
@@ -1153,16 +1253,63 @@ def selftest(args):
         yi = d["years"].index(2025)
         i = int(np.argmin(np.abs(np.array(d["lat"]) - 46.48))); j = int(np.argmin(np.abs(np.array(d["lon"]) - 30.73)))
         raw = d["data"][yi][i][j]
-        got = by["temperature"].sample(46.48, 30.73, 2025)["value"]
+        got = by["temperature"].sample(46.48, 30.73, by["temperature"].frame_at(2025.5))["value"]
         ok = abs(got - raw) < 0.011
         ok_all &= ok
         print(f"   temperature 2025 == temperature.json ({raw:+.3f} vs {got:+.3f}): {'OK' if ok else 'FAIL'}")
-    if "co2_curve" in by:
-        d = json.loads((L.DATA_DIR / "co2_curve" / "co2_curve.json").read_text())
-        raw = d["values"][d["years"].index(2000)]
-        ok = abs(by["co2_curve"].sample(0, 0, 2000)["value"] - raw) < 1e-6 and 2026 in by["co2_curve"].partial_years
+    for name_ in ("ocean_sst_video", "ocean_flow_activity"):   # кадри з датами: звірка з повним .json
+        if name_ not in by:
+            continue
+        lay = by[name_]
+        d = json.loads((L.DATA_DIR / name_ / f"{name_}.json").read_text())
+        i = int(np.argmin(np.abs(np.array(d["lat"]) - 35.0))); j = int(np.argmin(np.abs(np.array(d["lon"]) + 70.0)))
+        step_ = (lay.vmax - lay.vmin) / 254
+        errs = [abs(lay.sample(35.0, -70.0, k_)["value"] - d["data"][k_][i][j]) for k_ in (0, lay.n_frames - 1)]
+        ok = (lay.n_frames == len(d["dates"]) and lay.has_dates and lay.labels[0] == "28.03.2007"
+              and max(errs) <= step_ * 0.51)
         ok_all &= ok
-        print(f"   co2_curve 2000 == json ({raw}), 2026 позначено неповним: {'OK' if ok else 'FAIL'}")
+        print(f"   {name_}: {lay.n_frames} кадрів {lay.labels[0]}…{lay.labels[-1]}, Гольфстрім кадр 1/{lay.n_frames}: "
+              f"{lay.sample(35.0, -70.0, 0)['text']}, макс. похибка vs json {max(errs):.3f} (крок {step_:.3f}) "
+              f"{'OK' if ok else 'FAIL'}")
+    if "temperature" in by and "ocean_sst_video" in by:      # перемикання шару зберігає момент часу
+        te, ov = by["temperature"], by["ocean_sst_video"]
+        k_ = ov.frame_at(te.time_of(te.frame_at(2007.5)))
+        ok = int(ov.times[k_]) == 2007 and ov.frame_at(te.time_of(te.frame_at(1950.5))) == 0
+        ok_all &= ok
+        print(f"   temperature 2007 -> ocean_sst_video: кадр {ov.labels[k_]}; 1950 -> найближчий {ov.labels[0]} "
+              f"{'OK' if ok else 'FAIL'}")
+    ok = "co2_curve" not in by
+    ok_all &= ok
+    print(f"   лише карти (криві на кшталт co2_curve пропущено): {sorted(by)} {'OK' if ok else 'FAIL'}")
+
+    # ---- дві руки: права = карта, ліва = час ----
+    print("\n4b) Дві руки:")
+    from types import SimpleNamespace as NS
+
+    def fake(*hands):   # hands: (мітка MediaPipe, x зап'ястя)
+        lms = [[NS(x=x, y=0.5)] + [NS(x=x, y=0.5)] * 20 for _, x in hands]
+        hd = [[NS(category_name=lab, score=0.9)] for lab, _ in hands]
+        return NS(hand_landmarks=lms, handedness=hd)
+    r1 = hand_roles(fake(("Left", 0.7), ("Right", 0.2)))        # кадр не дзеркальний -> мітки навпаки
+    r2 = hand_roles(fake(("Left", 0.7), ("Right", 0.2)), swap=True)
+    r3 = hand_roles(fake(("Left", 0.2), ("Left", 0.7)))         # однакові мітки -> за положенням
+    ok_h = (r1["map"][0].x == 0.7 and r1["time"][0].x == 0.2 and r2["map"][0].x == 0.2
+            and r3["time"][0].x == 0.2 and r3["map"][0].x == 0.7)
+    print(f"   розподіл ролей (мітки MediaPipe, клавіша h, однакові мітки): {'OK' if ok_h else 'FAIL'}")
+    for tl in [l_ for l_ in by.values() if l_.dynamic]:
+        last = tl.n_frames - 1
+        ks = [frame_from_u(tl, u_, None) for u_ in (0.0, 0.5, 1.0, -0.3, 1.4)]
+        mid = round(0.5 * last)
+        hyst = frame_from_u(tl, (mid + 0.4) / last, mid)        # зсув на 0.4 кадру -> кадр не змінюється
+        moved = frame_from_u(tl, (mid + 1.0) / last, mid)       # зсув на 1 кадр -> змінюється
+        ok_y = ks == [0, mid, last, 0, last] and hyst == mid and moved == mid + 1
+        print(f"   {tl.name:20s} лівий палець -> кадр: край {tl.labels[ks[0]]}, середина {tl.labels[ks[1]]}, "
+              f"край {tl.labels[ks[2]]} (усі {tl.n_frames}); гістерезис  {'OK' if ok_y else 'FAIL'}")
+        tl_img = f2.copy()
+        draw_timeline(tl_img, cam_to_sheet_H(ft.corners), tl, mid, True)
+        cv2.imwrite(str(out / f"selftest_timeline_{tl.name}.png"), tl_img)
+        ok_h &= ok_y
+    ok_all &= ok_h
 
     print("\n5) Новий шар з NetCDF (конвертер layers.py from-netcdf), перевірка на sst.mnmean.nc:")
     if L.SST_FILE.exists():
@@ -1172,11 +1319,11 @@ def selftest(args):
         ds = xr.open_dataset(L.SST_FILE, engine="h5netcdf")
         ann = ds.sst.sel(time=slice("2020", "2020")).mean("time").sel(lat=-30.0, lon=200.0, method="nearest")
         raw = float(ann); ds.close()
-        got = lay.sample(-30.0, -160.0, 2020)["value"]
+        got = lay.sample(-30.0, -160.0, lay.frame_at(2020.5))["value"]
         step = (lay.vmax - lay.vmin) / 254
         ok = abs(got - raw) <= step
         ok_all &= ok
-        print(f"   створено {folder.name}/ ({len(lay.years)} років {lay.years[0]}–{lay.years[-1]}); "
+        print(f"   створено {folder.name}/ ({lay.n_frames} кадрів {lay.labels[0]}–{lay.labels[-1]}); "
               f"2020, 30°S 160°W: {got:.2f} vs NetCDF {raw:.2f} (крок {step:.3f}) {'OK' if ok else 'FAIL'}")
         found = [s.name for s in L.discover_layers(data_dir=out / "layers", sst_file=out / "none.nc")]
         ok = found == ["sst_annual_test"]
@@ -1187,7 +1334,7 @@ def selftest(args):
     print("\n6) Сонифікація (синтез без звукової карти):")
     sr = Sonifier.SR
     base_layer = by.get("sst") or next(iter(by.values()))
-    smp = base_layer.sample(46.48, 30.73, base_layer.default_year())
+    smp = base_layer.sample(46.48, 30.73, base_layer.default_frame())
     son = Sonifier(enabled=False)
     son.play(smp["norm"], 0.0, 30.73)
     son.render(sr // 2)                                         # дати параметрам усталитись
@@ -1219,7 +1366,7 @@ def selftest(args):
     ok_all &= ok_pitch and ok_pulse and ok_pan
 
     def render_route(layer, points, seconds, blk=512):
-        """points: [(lat, lon, year)]; лінійно між ними. -> стерео-масив"""
+        """points: [(lat, lon, момент у роках)]; лінійно між ними. -> стерео-масив"""
         son_ = Sonifier(enabled=False)
         nblk = int(seconds * sr / blk)
         seg = np.linspace(0, len(points) - 1, nblk)
@@ -1227,7 +1374,7 @@ def selftest(args):
         for k in range(nblk):
             i = min(int(seg[k]), len(points) - 2); f = seg[k] - i
             la, lo, yr = [points[i][q] + f * (points[i + 1][q] - points[i][q]) for q in range(3)]
-            r_ = layer.sample(la, lo, int(round(yr)) if layer.years is not None else None)
+            r_ = layer.sample(la, lo, layer.frame_at(yr + 0.5) if layer.dynamic else None)
             if r_["missing"]:
                 son_.missing(lo)
             else:
@@ -1245,9 +1392,6 @@ def selftest(args):
     if "temperature" in by:   # машина часу: одна точка (Одеса), 1880 -> 2025
         demos.append(("sonification_odesa_1880_2025.wav", "Одеса 1880→2025 (temperature)",
                       render_route(by["temperature"], [(46.48, 30.73, 1880), (46.48, 30.73, 2025)], 20.0)))
-    if "co2_curve" in by:
-        demos.append(("sonification_co2_1958_2025.wav", "CO₂ 1958→2025 (co2_curve)",
-                      render_route(by["co2_curve"], [(0, 0, 1958), (0, 0, 2025)], 15.0)))
     for fname, title, wav in demos:
         ok = np.abs(wav).max() < 0.99
         ok_all &= ok
@@ -1258,14 +1402,15 @@ def selftest(args):
     view, panel = L.LayerView(), Panel(340)
     for k, s in enumerate(specs, 1):
         lay = by[s.name]
-        y = lay.default_year()
-        smp = lay.sample(46.48, 30.73, y)
-        trail = [(43.5 + q * 0.3, 20 + q) for q in range(15)]
-        cv2.imwrite(str(out / f"selftest_view_{s.name}.png"), view.render(lay, y, (46.48, 30.73), trail, 0.6, smp["text"]))
+        y = lay.default_frame()
+        smp = lay.sample(35.0, -70.0, y)                         # Гольфстрім: є дані в усіх шарах океану
+        trail = [(30 + q * 0.6, -80 + q) for q in range(15)]
+        cv2.imwrite(str(out / f"selftest_view_{s.name}.png"), view.render(lay, y, (35.0, -70.0), trail, 0.6, smp["text"]))
         cv2.imwrite(str(out / f"selftest_panel_{s.name}.png"), panel.render(700, {
-            "layer": lay, "layer_idx": k, "n_layers": len(specs), "year": y, "playing": False, "state": "ok",
-            "pos": (46.48, 30.73), "sample": smp, "sheet": "tracked", "inliers": 640, "dwell": 0.6,
-            "note": f"{midi_name(norm_to_midi(smp['norm']))}", "last_fix": report(lay, y, 46.48, 30.73, smp)}))
+            "layer": lay, "layer_idx": k, "n_layers": len(specs), "t": y, "playing": False, "state": "ok",
+            "pos": (35.0, -70.0), "sample": smp, "sheet": "tracked", "inliers": 640, "dwell": 0.6,
+            "note": None if smp["missing"] else midi_name(norm_to_midi(smp["norm"])),
+            "last_fix": report(lay, y, 35.0, -70.0, smp)}))
     cv2.imwrite(str(out / "selftest_sheet.png"), cv2.polylines(hand, [np.int32(tracker.corners)], True, (0, 200, 0), 3))
     print(f"   збережено в {out}/")
     print("\nSELFTEST", "PASSED" if ok_all else "FAILED")
@@ -1277,8 +1422,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", type=int, default=0, help="індекс камери (0 - вбудована)")
     ap.add_argument("--recalibrate", action="store_true", help="пройти калібрування заново")
-    ap.add_argument("--layer", help="шар даних на старті (назва: sst, temperature, co2_curve, ...; див. layers.py list)")
-    ap.add_argument("--year", type=int, help="рік на старті (для шарів з роками)")
+    ap.add_argument("--layer", help="шар даних на старті (назва: sst, temperature, ...; див. layers.py list)")
+    ap.add_argument("--swap-hands", action="store_true",
+                    help="поміняти ролі рук (якщо програма плутає ліву і праву; у вікні - клавіша h)")
+    ap.add_argument("--year", type=int, help="рік на старті: береться найближчий кадр шару")
     ap.add_argument("--step", type=float, default=0.3, help="секунд на рік у режимі відтворення (p)")
     ap.add_argument("--dwell", type=float, default=3.0, help="скільки секунд тримати палець для запису в консоль")
     ap.add_argument("--radius", type=float, default=0.02,
