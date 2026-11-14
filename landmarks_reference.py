@@ -36,8 +36,9 @@ def marker(ax, lat, lon, n, size):
                 color="white", fontsize=size * 0.75, fontweight="bold", zorder=6)
 
 
-fig = plt.figure(figsize=(16, 15), layout="constrained")
-gs = fig.add_gridspec(3, 4, height_ratios=[2.1, 1, 1])
+fig = plt.figure(figsize=(19, 15), layout="constrained")
+COLS = 5
+gs = fig.add_gridspec(3, COLS, height_ratios=[2.1, 1, 1])
 
 # --- світова карта ---
 ax = fig.add_subplot(gs[0, :])
@@ -49,12 +50,12 @@ ZOOM = 9  # половина ширини фрагмента, градусів
 for n, (_, ua, lat, lon) in enumerate(LANDMARKS, 1):
     ax.add_patch(Rectangle((lon - ZOOM, lat - ZOOM * 0.75), 2 * ZOOM, 1.5 * ZOOM, fill=False, ec=MARK, lw=0.8, ls="--"))
     marker(ax, lat, lon, n, 16)
-ax.set_title("Точки калібрування: клацайте ЦІ місця на зображенні з камери (по порядку 1 -> 8)",
+ax.set_title(f"Точки калібрування: клацайте ЦІ місця на зображенні з камери (по порядку 1 -> {len(LANDMARKS)})",
              fontsize=14, fontweight="bold", loc="left")
 
 # --- збільшені фрагменти ---
 for n, (_, ua, lat, lon) in enumerate(LANDMARKS, 1):
-    a = fig.add_subplot(gs[1 + (n - 1) // 4, (n - 1) % 4])
+    a = fig.add_subplot(gs[1 + (n - 1) // COLS, (n - 1) % COLS])
     draw_land(a, 0.7)
     a.set_xlim(lon - ZOOM, lon + ZOOM); a.set_ylim(lat - ZOOM * 0.75, lat + ZOOM * 0.75)
     a.set_aspect("equal", adjustable="box")

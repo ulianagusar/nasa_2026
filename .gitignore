@@ -14,6 +14,7 @@ __pycache__/
 
 # --- калібрування камери: залежить від того, де стоїть камера і лежить карта ---
 calibration.json
+calibration_template.png
 
 # --- великі дані, завантажуються окремо (див. команди нижче) ---
 # NOAA ERSST v5, ~160 МБ (GitHub не приймає файли > 100 МБ):
@@ -28,6 +29,9 @@ models/
 # Контури суші Natural Earth, ~1.6 МБ:
 #   mkdir -p data && curl -L -o data/ne_50m_land.geojson https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson
 data/
+
+# --- результати самотесту finger_map.py --selftest ---
+selftest_out/
 
 # --- відео/аудіо/кадри, які згенеруємо пізніше ---
 frames/
