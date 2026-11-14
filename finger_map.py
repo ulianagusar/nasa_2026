@@ -42,6 +42,7 @@ import numpy as np
 
 import layers as L
 import speech as SP
+import globe as GB
 
 HERE = Path(__file__).resolve().parent
 CALIB_FILE = HERE / "calibration.json"
@@ -68,6 +69,11 @@ KEYS = [
     ("c", "клавіша це", "калібрування карти заново"),
     ("k", "клавіша ка", "заново позначити кути карти"),
     ("q", "клавіша кю", "вихід"),
+]
+# Глобус: часу лівою рукою немає, тож "кома/крапка/p" - головне керування часом; c/k означають інше.
+KEYS_GLOBE = [k for k in KEYS if k[0] not in ("c", "k")] + [
+    ("c", "клавіша це", "калібрування глобуса заново"),
+    ("k", "клавіша ка", "заново вивчити кольори і запам'ятати поточний бік глобуса"),
 ]
 
 # Впізнавані точки для калібрування: (назва для вікна, назва для консолі, lat, lon)
@@ -585,6 +591,208 @@ def capture_template(cap, corners):
 
 
 # ----------------------------------------------------------------------------
+# Глобус (--surface globe): калібрування і допоміжне. Математика - у globe.py
+# ----------------------------------------------------------------------------
+# На глобусі одночасно видно лише півкулю, тож для нього більше знайомих місць по всьому світу.
+GLOBE_EXTRA_LANDMARKS = [
+    ("Cape Guardafui - Horn of Africa", "мис Гвардафуй (Африканський Ріг)", 11.83, 51.28),
+    ("Cape Verde - Dakar, W tip of Africa", "Зелений Мис, Дакар (захід Африки)", 14.72, -17.53),
+    ("Cabo Sao Roque - E tip of Brazil", "мис Сан-Роке (схід Бразилії)", -5.48, -35.26),
+    ("Singapore - S tip of Malay peninsula", "Сінгапур (південь Малаккського півострова)", 1.26, 103.82),
+    ("Cape Reinga - N tip of New Zealand", "мис Реінга (північ Нової Зеландії)", -34.43, 172.68),
+    ("S tip of Tasmania", "південь Тасманії", -43.64, 146.83),
+    ("Cape Prince of Wales - Bering Strait", "Берингова протока (Аляска)", 65.6, -168.09),
+    ("S tip of Florida", "південь Флориди", 25.12, -81.09),
+]
+GLOBE_LANDMARKS = LANDMARKS + GLOBE_EXTRA_LANDMARKS
+
+
+class GlobeSurface:
+    """Те, що run_tracking потребує від глобуса: модель (піксель -> lat/lon), відстеження повороту, накладання."""
+
+    def __init__(self, model, tracker):
+        self.model, self.tracker = model, tracker
+        self.overlay = GB.GlobeOverlay(model)
+
+
+def hands_mask(res, w, h):
+    """Маска рук (і передпліччя) для відстеження глобуса: ці пікселі не порівнюються з картою суші."""
+    mask = np.zeros((h, w), np.uint8)
+    for lms in (res.hand_landmarks or []):
+        pts = np.array([[p.x * w, p.y * h] for p in lms])
+        wrist, mid = pts[0], pts[9]
+        arm = wrist + 3.0 * (wrist - mid)                       # передпліччя: продовжуємо від зап'ястя
+        hull = cv2.convexHull(np.int32(np.vstack([pts, arm[None]])))
+        cv2.fillConvexPoly(mask, hull, 255)
+    if mask.any():
+        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+    return mask
+
+
+def pick_globe_circle(cap, scale, win="Calibration"):
+    """Крок 1: обрис глобуса (A = прийняти знайдене автоматично коло, або 3 кліки по краю кулі)."""
+    print("\n--- Крок 1: обрис глобуса ---")
+    print("Натисніть A, якщо зелене коло точно лягло по краю кулі, або клацніть 3 точки на краю глобуса.")
+    print("  u - скасувати клік, q - вийти.")
+    clicks = []
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win, lambda ev, x, y, *_: clicks.append((x / scale, y / scale))
+                         if ev == cv2.EVENT_LBUTTONDOWN else None)
+    while True:
+        frame = _read(cap)
+        auto = GB.detect_globe_circle(frame)
+        if auto is not None:
+            cv2.circle(frame, (int(auto[0]), int(auto[1])), int(auto[2]), (0, 200, 0), 2, cv2.LINE_AA)
+        for c in clicks[:3]:
+            cv2.circle(frame, (int(c[0]), int(c[1])), 7, (0, 0, 255), 2)
+        _banner(frame, [f"Step 1/2: globe outline - click 3 points on the edge ({len(clicks)}/3)",
+                        ("A = accept green circle  |  " if auto is not None else "") + "u=undo  q=quit"], scale)
+        _show(win, frame, scale)
+        key = cv2.waitKey(15) & 0xFF
+        if key == ord("q"):
+            raise SystemExit(0)
+        if key == ord("u") and clicks:
+            clicks.pop()
+        if key == ord("a") and auto is not None:
+            print(f"  Прийнято коло: центр ({auto[0]:.0f}, {auto[1]:.0f}), радіус {auto[2]:.0f} px")
+            return auto
+        if len(clicks) >= 3:
+            c = GB.circle_from_3pts(*clicks[:3])
+            if c is None:
+                print("  Точки на одній прямій, клацніть ще раз.")
+                clicks.clear()
+                continue
+            print(f"  Коло з 3 точок: центр ({c[0]:.0f}, {c[1]:.0f}), радіус {c[2]:.0f} px")
+            return c
+
+
+def run_globe_calibration(cap, args, scale):
+    print("\n=== КАЛІБРУВАННЯ ГЛОБУСА === Під час калібрування глобус не крутіть, руку приберіть.")
+    circle = pick_globe_circle(cap, scale)
+    frame = _read(cap)
+    H_, W_ = frame.shape[:2]
+    print("\n--- Крок 2: знайомі місця на видимому боці глобуса ---")
+    print("Клацайте місце, назва якого написана зверху. s - пропустити (місце на зворотному боці),")
+    print("u - скасувати, Enter - завершити (мінімум 3, краще 5+), q - вийти.")
+    print("Після 3 місць програма підкаже, де шукати наступне (жовте коло), і сама пропустить невидимі.\n")
+    win = "Calibration"
+    clicks, cam_pts, geo_pts = [], [], []
+    cv2.setMouseCallback(win, lambda ev, x, y, *_: clicks.append((x / scale, y / scale))
+                         if ev == cv2.EVENT_LBUTTONDOWN else None)
+    idx, prelim, announced = 0, None, -1
+    while True:
+        frame = _read(cap)
+        # після 3 точок: попередня орієнтація -> підказка і автопропуск місць на зворотному боці
+        while prelim is not None and idx < len(GLOBE_LANDMARKS):
+            x, y, vis = prelim.project_latlon(*GLOBE_LANDMARKS[idx][2:])
+            _, _, fac = prelim.geom.hit(np.array([x]), np.array([y]))
+            if bool(vis) and fac[0] > 0.2:
+                break
+            print(f"  [{idx + 1}/{len(GLOBE_LANDMARKS)}] {GLOBE_LANDMARKS[idx][1]} - на зворотному боці, пропущено")
+            idx += 1
+        if idx < len(GLOBE_LANDMARKS) and announced != idx:
+            print(f"  [{idx + 1}/{len(GLOBE_LANDMARKS)}] {GLOBE_LANDMARKS[idx][1]}")
+            announced = idx
+        if clicks:
+            c = clicks[-1]
+            clicks.clear()
+            if idx < len(GLOBE_LANDMARKS):
+                if (c[0] - circle[0]) ** 2 + (c[1] - circle[1]) ** 2 > circle[2] ** 2:
+                    print("      клік поза глобусом - спробуйте ще раз")
+                else:
+                    cam_pts.append(c); geo_pts.append(GLOBE_LANDMARKS[idx][2:])
+                    print(f"      клік ({c[0]:.0f}, {c[1]:.0f}) -> {GLOBE_LANDMARKS[idx][2]:+.2f}, {GLOBE_LANDMARKS[idx][3]:+.2f}")
+                    idx += 1
+                    if len(cam_pts) >= 3:
+                        try:
+                            g_, R_, e_ = GB.solve_pose(cam_pts, geo_pts, circle[:2], circle[2], (W_, H_))
+                            prelim = GB.GlobeModel(g_, R_)
+                        except ValueError:
+                            prelim = None
+        cv2.circle(frame, (int(circle[0]), int(circle[1])), int(circle[2]), (0, 200, 0), 2, cv2.LINE_AA)
+        for k, c in enumerate(cam_pts):
+            cv2.circle(frame, (int(c[0]), int(c[1])), 7, (0, 0, 255), 2)
+            cv2.putText(frame, str(k + 1), (int(c[0]) + 9, int(c[1]) - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        if prelim is not None and idx < len(GLOBE_LANDMARKS):
+            x, y, _ = prelim.project_latlon(*GLOBE_LANDMARKS[idx][2:])
+            cv2.circle(frame, (int(x), int(y)), 22, (0, 220, 255), 2, cv2.LINE_AA)
+        title = (f"Step 2/2: click {GLOBE_LANDMARKS[idx][0]}" if idx < len(GLOBE_LANDMARKS)
+                 else "All points done - press Enter")
+        _banner(frame, [title, f"points: {len(cam_pts)}  |  s=skip  u=undo  Enter=finish  q=quit"], scale)
+        _show(win, frame, scale)
+        key = cv2.waitKey(15) & 0xFF
+        if key == ord("q"):
+            raise SystemExit(0)
+        if key == ord("s") and idx < len(GLOBE_LANDMARKS):
+            print("      пропущено")
+            idx += 1
+        if key == ord("u") and cam_pts:
+            cam_pts.pop(); geo_pts.pop(); idx = max(0, idx - 1); announced = -1
+            prelim = None
+        if key in (13, 10):
+            if len(cam_pts) < 3:
+                print("  Потрібно щонайменше 3 місця.")
+                continue
+            break
+    geom, R0, err = GB.solve_pose(cam_pts, geo_pts, circle[:2], circle[2], (W_, H_))
+    model = GB.GlobeModel(geom, R0)
+    tracker = GB.GlobeTracker(model)
+    frame = _read(cap)
+    tracker.learn_colors(frame, 0.0)
+    tracker.memory.add_from_frame(frame, model, tracker.orb, min_facing=0.6)
+    fov = np.degrees(2 * np.arctan(W_ / 2 / geom.f))
+    print(f"  Орієнтацію знайдено: поле зору камери {fov:.0f}°, середня похибка місць {err:.1f}° (~{err * 111:.0f} км)")
+    globe_tour(cap, tracker, scale, win)
+    cv2.destroyWindow(win)
+    GB.save_globe(GB.GLOBE_CALIB, model, tracker, {"clicks": cam_pts, "latlons": geo_pts})
+    print(f"  Збережено: {GB.GLOBE_CALIB.name} (калібрування) і {GB.GLOBE_MEMORY.name} "
+          f"(пам'ять глобуса, {len(tracker.memory)} точок)\n")
+    return GlobeSurface(model, tracker)
+
+
+def globe_tour(cap, tracker, scale, win="Calibration", target=0.95):
+    """Крок 3: глобус на місці, його повільно обертають на повний оберт - програма запам'ятовує всі боки.
+    Кут визначається за контурами суші (без накопичення похибки), руку з порівняння вирізаємо."""
+    print("\n--- Крок 3: запам'ятати глобус ---")
+    print("Повільно поверніть глобус на повний оберт навколо осі (підставку не рухайте).")
+    print("Програма запам'ятовує кожен бік, щоб потім знаходити глобус будь-де в кадрі.")
+    print("  Enter - завершити раніше, s - пропустити (тоді глобус не можна буде переставляти), q - вийти.")
+    mp, landmarker = make_landmarker()
+    t0, last_ts, shown = time.monotonic(), -1, -1
+    overlay = GB.GlobeOverlay(tracker.model)
+    try:
+        while True:
+            frame = _read(cap)
+            h, w = frame.shape[:2]
+            ts = max(int((time.monotonic() - t0) * 1000), last_ts + 1); last_ts = ts
+            res = landmarker.detect_for_video(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), ts)
+            theta, cov = tracker.tour_step(frame, hands_mask(res, w, h) if res.hand_landmarks else None)
+            overlay.draw(frame, tracker.status)
+            pct = int(cov * 100)
+            if pct // 10 != shown // 10:
+                print(f"  вивчено {pct}% глобуса (точок у пам'яті: {len(tracker.memory)})")
+                shown = pct
+            bw = int(w * 0.6)
+            cv2.rectangle(frame, (int(w * 0.2), h - 40), (int(w * 0.2) + bw, h - 20), (200, 200, 200), 1)
+            cv2.rectangle(frame, (int(w * 0.2), h - 40), (int(w * 0.2 + bw * cov), h - 20), (0, 200, 0), -1)
+            _banner(frame, [f"Step 3/3: slowly rotate the globe one full turn - learned {pct}%",
+                            f"angle {theta:.0f} deg  |  Enter=finish  s=skip  q=quit"], scale)
+            _show(win, frame, scale)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                raise SystemExit(0)
+            if key in (13, 10, ord("s")) or cov >= target:
+                if cov >= target:
+                    print(f"  Глобус вивчено ({pct}%).")
+                elif key == ord("s"):
+                    print("  Тур пропущено: глобус розпізнається лише з того боку, що був на калібруванні.")
+                return
+    finally:
+        landmarker.close()
+
+
+# ----------------------------------------------------------------------------
 # Звіт у консоль і панель з живим значенням шару (PIL, щоб була кирилиця)
 # ----------------------------------------------------------------------------
 ROLE_COLORS = {"ink": INK, "ink2": INK2, "muted": MUTED, "warm": WARM, "cool": COOL}
@@ -642,7 +850,8 @@ class Panel:
             k = layer.clamp_frame(info["t"])
             d.text((x, y), f"{'дата' if layer.has_dates else 'рік'} {layer.time_label(k)}" + mode, font=self.f["s"],
                    fill=col("cool" if info.get("time_hand") else "ink2")); y += 22
-            d.text((x, y), f"ліва рука вздовж карти: {layer.short_label(0)} ← → {layer.short_label(layer.n_frames - 1)}",
+            how = "ліва рука вздовж карти" if info.get("surface") != "globe" else "період (клавіші)"
+            d.text((x, y), f"{how}: {layer.short_label(0)} ← → {layer.short_label(layer.n_frames - 1)}",
                    font=self.f["xs"], fill=col("muted")); y += 17
             d.text((x, y), f"кадр {k + 1}/{layer.n_frames}   , . ±1   < > ±10   p ▶/❚❚", font=self.f["xs"],
                    fill=col("muted")); y += 20
@@ -654,6 +863,8 @@ class Panel:
         d.text((x, y), "ПІД ПРАВИМ ПАЛЬЦЕМ", font=self.f["xs"], fill=col("muted")); y += 20
         if info.get("pos"):
             d.text((x, y), L.fmt_coord(*info["pos"]), font=self.f["m"], fill=col("ink")); y += 28
+            if info.get("edge"):
+                d.text((x, y), "біля краю глобуса: точність нижча", font=self.f["xs"], fill=col("muted")); y += 18
         if s is not None:
             if s["missing"]:
                 d.text((x, y), layer.missing_label, font=self.f["xl"], fill=col("ink2")); y += 60
@@ -686,7 +897,12 @@ class Panel:
               "static": "фіксовані"}[info.get("sheet", "static")]
         if info.get("inliers") and info.get("sheet") == "tracked":
             st += f" ({info['inliers']} точок)"
-        d.text((x, y), f"Карта: {st}", font=self.f["xs"], fill=col("ink2")); y += 18
+        gi = info.get("globe")
+        if gi is not None and info.get("sheet") == "tracked":
+            st = (f"знайдено ({gi['inliers']} точок)" if gi["mode"] == "features" else "за контурами суші")
+            st += f" · вивчено {gi['coverage'] * 100:.0f}%"
+        d.text((x, y), f"{'Глобус' if info.get('surface') == 'globe' else 'Карта'}: {st}", font=self.f["xs"],
+               fill=col("ink2")); y += 18
         snd = "вимкнено (m)" if info.get("muted") else (f"нота {info['note']}" if info.get("note") else "тиша")
         d.text((x, y), f"Звук: {snd}", font=self.f["xs"], fill=col("ink2")); y += 18
         vo = info.get("voice")
@@ -922,10 +1138,13 @@ def draw_timeline(frame, G, layer, t, active):
                 cv2.LINE_AA)
 
 
-def run_tracking(cap, cal, specs, args, scale):
+def run_tracking(cap, cal, specs, args, scale, globe=None):
     mp, landmarker = make_landmarker()
     frame = _read(cap)
-    tracker = make_tracker(args.track, cal, frame.shape)
+    tracker = make_tracker(args.track, cal, frame.shape) if globe is None else globe.tracker
+    keys = KEYS if globe is None else KEYS_GLOBE
+    surface = "map" if globe is None else "globe"
+    off_word = "палець поза картою" if globe is None else "палець поза глобусом"
     finger, time_finger = OneEuro(), OneEuro(min_cutoff=0.8)
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
     geo = SP.Geocoder()                                         # країни / моря / регіони з українськими назвами
@@ -944,10 +1163,15 @@ def run_tracking(cap, cal, specs, args, scale):
     print("=== ТРЕКІНГ === Шари даних:")
     for k, s in enumerate(specs, 1):
         print(f"   {k}. {s.title}" + ("   <- зараз" if k - 1 == li else ""))
-    print("   ПРАВА рука, вказівний палець: водити по карті.")
-    print("   ЛІВА рука, вказівний палець: час - вести вздовж карти (лівий край = перший кадр, правий = останній).")
+    if globe is None:
+        print("   ПРАВА рука, вказівний палець: водити по карті.")
+        print("   ЛІВА рука, вказівний палець: час - вести вздовж карти (лівий край = перший кадр, правий = останній).")
+    else:
+        print("   ПРАВА рука, вказівний палець: показувати на глобус. Глобус можна крутити, переставляти й нахиляти:")
+        print(f"   програма знаходить його за запам'ятованими точками (пам'ять: {len(getattr(tracker, 'memory', []))} точок).")
+        print("   Час - клавішами: , . (крок), < > (10 кроків), p (програвання).")
     print("   Клавіші у вікні:")
-    for disp, _, what in KEYS:
+    for disp, _, what in keys:
         print(f"   {disp:>5s}  {what.replace('{n}', str(min(len(specs), 9)))}")
     print(f"   Правий палець {args.dwell:.0f} с на місці -> запис сюди.")
     if son.stream is not None:
@@ -971,7 +1195,7 @@ def run_tracking(cap, cal, specs, args, scale):
         layer = specs[li].load()
         t = layer.frame_at(when)
         trail.clear()
-        intro = SP.layer_intro(li + 1, len(specs), layer)
+        intro = SP.layer_intro(li + 1, len(specs), layer, surface)
         print(f"   🔊 {intro}")
         voice.speak(intro)
 
@@ -997,12 +1221,14 @@ def run_tracking(cap, cal, specs, args, scale):
         now = time.monotonic()
         ts = max(int((now - t0) * 1000), last_ts + 1); last_ts = ts
 
-        corners = tracker.update(frame)
-        G = cam_to_sheet_H(corners)
-
         res = landmarker.detect_for_video(
             mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), ts)
         roles = hand_roles(res, swap) if res.hand_landmarks else {}
+        if globe is None:
+            corners = tracker.update(frame)
+            G = cam_to_sheet_H(corners)
+        else:                                                  # поворот глобуса; руку не порівнюємо з картою суші
+            tracker.update(frame, hands_mask(res, w, h) if res.hand_landmarks else None)
 
         # ---- права рука: точка на карті ----
         if "map" in roles:
@@ -1015,7 +1241,7 @@ def run_tracking(cap, cal, specs, args, scale):
 
         # ---- ліва рука: час ----
         time_hand = False
-        if "time" in roles:
+        if "time" in roles and globe is None:
             lm = roles["time"][INDEX_TIP]
             tsmooth = time_finger(np.array([lm.x * w, lm.y * h]), now).copy()
             time_seen = now
@@ -1040,18 +1266,27 @@ def run_tracking(cap, cal, specs, args, scale):
         info = {"state": "nohand", "sheet": tracker.status, "dwell": 0.0, "last_fix": last_fix,
                 "inliers": getattr(tracker, "inliers", None), "layer": layer, "layer_idx": li + 1,
                 "n_layers": len(specs), "t": t, "playing": playing, "time_hand": time_hand,
-                "voice": voice.voice if voice.enabled else None, "speaking": voice.speaking()}
+                "voice": voice.voice if voice.enabled else None, "speaking": voice.speaking(), "surface": surface,
+                "globe": None if globe is None else {"mode": getattr(tracker, "mode", "spin"),
+                                                     "inliers": getattr(tracker, "inliers", 0),
+                                                     "coverage": tracker.coverage() if hasattr(tracker, "coverage") else 0}}
         lat = lon = None
         frac = 0.0
         if smooth is not None:
-            u, v = apply_H(G, [smooth])[0]
-            on_sheet = -0.02 <= u <= 1.02 and -0.02 <= v <= 1.02
-            lat, lon, ok = cal.sheet_to_latlon(u, v)
+            if globe is None:
+                u, v = apply_H(G, [smooth])[0]
+                on_sheet = -0.02 <= u <= 1.02 and -0.02 <= v <= 1.02
+                lat, lon, ok = cal.sheet_to_latlon(u, v)
+                ok = ok and on_sheet
+            else:
+                lat, lon, hit, facing = globe.model.to_latlon(*smooth)
+                ok = hit and facing > 0.12                     # самий край кулі - ненадійно
+                info["edge"] = ok and facing < 0.35
             if anchor is None or np.hypot(*(smooth - anchor)) > args.radius * max(w, h):
                 anchor, anchor_t, fired = smooth.copy(), now, False
             frac = min(1.0, (now - anchor_t) / args.dwell)
             info["dwell"] = frac
-            if ok and on_sheet:
+            if ok:
                 info.update(state="ok", pos=(lat, lon))
                 trail.append((lat, lon))
             else:
@@ -1076,8 +1311,8 @@ def run_tracking(cap, cal, specs, args, scale):
                 son.chime()
                 voice.speak(last_spoken)
             else:
-                print(f"[{datetime.now():%H:%M:%S}] палець поза картою")
-                voice.speak("Палець поза картою.")
+                print(f"[{datetime.now():%H:%M:%S}] {off_word}")
+                voice.speak(off_word.capitalize() + ".")
         son.set_duck(voice.speaking())
 
         # ---- звук ----
@@ -1090,12 +1325,15 @@ def run_tracking(cap, cal, specs, args, scale):
         info["note"] = None if son.note is None else f"{midi_name(son.note)} · {midi_to_hz(son.note):.0f} Гц"
         info["muted"] = son.muted or son.stream is None
 
-        qcol = {"tracked": (0, 200, 0), "held": (0, 200, 255), "searching": (0, 0, 255), "static": (200, 200, 200)}
-        cv2.polylines(frame, [np.int32(corners)], True, qcol[tracker.status], 2)
-        for p in corners:
-            cv2.circle(frame, (int(p[0]), int(p[1])), 6, qcol[tracker.status], -1)
-        if layer.dynamic:
-            draw_timeline(frame, G, layer, t, time_hand)
+        if globe is None:
+            qcol = {"tracked": (0, 200, 0), "held": (0, 200, 255), "searching": (0, 0, 255), "static": (200, 200, 200)}
+            cv2.polylines(frame, [np.int32(corners)], True, qcol[tracker.status], 2)
+            for p in corners:
+                cv2.circle(frame, (int(p[0]), int(p[1])), 6, qcol[tracker.status], -1)
+            if layer.dynamic:
+                draw_timeline(frame, G, layer, t, time_hand)
+        else:                                                  # обрис, сітка і берегові лінії: видно, чи збіглося
+            globe.overlay.draw(frame, tracker.status)
 
         cam = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         ph = max(cam.shape[0], 700)
@@ -1132,7 +1370,7 @@ def run_tracking(cap, cal, specs, args, scale):
             announce(SP.layers_announcement(specs, li + 1))
         if key in (ord("?"), ord("/")):
             son.silence()
-            announce(SP.help_announcement(KEYS, len(specs)))
+            announce(SP.help_announcement(keys, len(specs), surface))
         if key == ord("h"):
             swap = not swap
             print("Руки поміняно місцями: тепер " + ("ліва водить по карті, права керує часом" if swap
@@ -1150,11 +1388,23 @@ def run_tracking(cap, cal, specs, args, scale):
                 playing = not playing
                 last_step = now
                 print("Відтворення кадрів: " + ("▶" if playing else "пауза"))
-        if key == ord("c"):
+        if key == ord("c") and globe is not None:
+            son.silence()
+            globe = run_globe_calibration(cap, args, scale)
+            tracker = globe.tracker
+        elif key == ord("c"):
             son.silence()
             cal = run_calibration(cap, args, scale)
             tracker = make_tracker(args.track, cal, frame.shape)
-        if key == ord("k"):
+        if key == ord("k") and globe is not None:
+            # освітлення змінилось -> заново вивчити кольори "вода/суша" при поточному повороті
+            hm = hands_mask(res, w, h) if res.hand_landmarks else None
+            tracker.learn_colors(frame, None, hand_mask=hm)
+            if hasattr(tracker, "memory"):
+                tracker.memory.add_from_frame(frame, globe.model, tracker.orb, hm, min_facing=0.6)
+            GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)
+            print("Кольори глобуса оновлено, поточний бік дозапам'ятовано")
+        elif key == ord("k"):
             # ті самі 4 кути заново (напр. змінилось освітлення) -> новий еталон, калібрування місць лишається
             son.silence()
             corners = pick_corners(cap, scale)
@@ -1167,6 +1417,8 @@ def run_tracking(cap, cal, specs, args, scale):
     voice.stop()
     son.close()
     landmarker.close()
+    if globe is not None:
+        GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)       # останнє положення + дозапам'ятовані боки
 
 
 # ----------------------------------------------------------------------------
@@ -1364,7 +1616,7 @@ def selftest(args):
 
     # ---- дві руки: права = карта, ліва = час ----
     print("\n4b) Дві руки:")
-    from types import SimpleNamespace as NS
+    from types import SimpleNamespace as NS  # noqa: F811
 
     def fake(*hands):   # hands: (мітка MediaPipe, x зап'ястя)
         lms = [[NS(x=x, y=0.5)] + [NS(x=x, y=0.5)] * 20 for _, x in hands]
@@ -1473,6 +1725,102 @@ def selftest(args):
     print(f"   приглушення синтезатора під час голосу: {loud:.2f} -> {quiet:.2f} {'OK' if ok_d else 'FAIL'}")
     ok_all &= ok_g and ok_p and ok_d
 
+    print("\n5c) Глобус (синтетичний кадр камери):")
+    Wg, Hg = 1280, 720
+
+    def look(lat0, lon0, tilt):                                 # орієнтація: точка (lat0, lon0) дивиться на камеру
+        fwd = GB.latlon_to_vec(lat0, lon0); north = np.array([0, 0, 1.0])
+        up = north - fwd * (north @ fwd); up /= np.linalg.norm(up); right = np.cross(up, fwd)
+        a = np.radians(tilt)
+        return np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]]) @ np.stack([right, -up, -fwd])
+    geom_t = GB.GlobeGeometry((660, 370), 260, GB.fov_to_f(62, Wg), (Wg, Hg))
+    R0_t = look(25, 15, 8)
+    g0 = GB.render_synthetic(geom_t, R0_t, (Hg, Wg, 3))
+    u_, v_, r_ = GB.detect_globe_circle(g0)
+    ok_c = np.hypot(u_ - 660, v_ - 370) < 4 and abs(r_ - 260) < 4
+    print(f"   обрис: центр ({u_:.0f},{v_:.0f}) r={r_:.0f} (істина 660,370 r=260) {'OK' if ok_c else 'FAIL'}")
+    mt = GB.GlobeModel(geom_t, R0_t)
+    clicks_, ll_ = [], []
+    for lm_ in GLOBE_LANDMARKS:
+        x_, y_, vis_ = mt.project_latlon(*lm_[2:])
+        _, _, fac_ = geom_t.hit(np.array([x_]), np.array([y_]))
+        if vis_ and fac_[0] > 0.25:
+            clicks_.append((x_ + rng.normal(0, 1.5), y_ + rng.normal(0, 1.5))); ll_.append(lm_[2:])
+    geom_g, R0_g, err_g = GB.solve_pose(clicks_, ll_, (u_, v_), r_, (Wg, Hg))
+    fov_g = np.degrees(2 * np.arctan(Wg / 2 / geom_g.f))
+    ang_g = np.degrees(np.arccos(np.clip((np.trace(R0_g.T @ R0_t) - 1) / 2, -1, 1)))
+    ok_o = abs(fov_g - 62) <= 3 and ang_g < 2
+    print(f"   калібрування: {len(clicks_)} видимих місць, поле зору {fov_g:.0f}° (істина 62°), "
+          f"похибка орієнтації {ang_g:.2f}° {'OK' if ok_o else 'FAIL'}")
+    gs = GlobeSurface(GB.GlobeModel(geom_g, R0_g), None)
+    gs.tracker = GB.SpinTracker(gs.model)
+    gs.tracker.learn_colors(g0, 0.0)
+    errs_th, errs_km, times_ = [], [], []
+    for th_t in (0, 37, 120, -75, 181):
+        Rt = R0_t @ GB.rot_z(th_t)
+        img_g = GB.render_synthetic(geom_t, Rt, (Hg, Wg, 3), seed=abs(th_t) % 97)
+        # фальшива рука MediaPipe над глобусом: маска має її вирізати
+        fake = NS(hand_landmarks=[[NS(x=(700 + 8 * k) / Wg, y=(380 + 12 * k) / Hg) for k in range(21)]])
+        hm = hands_mask(fake, Wg, Hg)
+        cv2.line(img_g, (700, 380), (900, 719), (90, 140, 200), 80)
+        gs.model.theta, gs.tracker.locked = 0.0, False
+        t0_ = time.perf_counter(); th_ = gs.tracker.update(img_g, hm); times_.append((time.perf_counter() - t0_) * 1000)
+        errs_th.append(abs(GB.angdiff(th_, th_t % 360)))
+        mtt = GB.GlobeModel(geom_t, Rt)
+        for _ in range(150):
+            la_, lo_ = rng.uniform(-80, 80), rng.uniform(-180, 180)
+            x_, y_, vis_ = mtt.project_latlon(la_, lo_)
+            _, _, fac_ = geom_t.hit(np.array([x_]), np.array([y_]))
+            if vis_ and fac_[0] > 0.3:
+                la2, lo2, okk, _ = gs.model.to_latlon(x_, y_)
+                errs_km.append(L.haversine_km(la_, lo_, la2, lo2))
+        if th_t == 37:
+            ov_img = img_g.copy(); gs.overlay.draw(ov_img, gs.tracker.status)
+            cv2.imwrite(str(out / "selftest_globe.png"), ov_img)
+    ok_s = max(errs_th) < 2.0                                  # менше за одну клітинку даних (2°)
+    ok_f = np.median(errs_km) < 60
+    print(f"   поворот глобуса 0/37/120/-75/181° з рукою: макс. похибка {max(errs_th):.2f}°, "
+          f"{np.mean(times_):.0f} мс/кадр {'OK' if ok_s else 'FAIL'}")
+    print(f"   палець -> координати: медіана {np.median(errs_km):.0f} км, 95% {np.percentile(errs_km, 95):.0f} км "
+          f"({len(errs_km)} точок) {'OK' if ok_f else 'FAIL'}")
+    # --- запам'ятати глобус (тур) і знаходити його будь-де: переставлений, нахилений, з будь-якого боку
+    tex_g = GB.synthetic_texture()
+    gA_ = GB.GlobeGeometry((660, 370), 260, GB.fov_to_f(62, Wg), (Wg, Hg))
+    imgA_ = GB.render_synthetic(gA_, R0_t, (Hg, Wg, 3), texture=tex_g)
+    mdl = GB.GlobeModel(GB.GlobeGeometry((661, 368), 260, GB.fov_to_f(62, Wg), (Wg, Hg)), R0_t @ GB.rot_z(0.5))
+    gtr = GB.GlobeTracker(mdl)
+    gtr.learn_colors(imgA_, 0.0)
+    gtr.memory.add_from_frame(imgA_, mdl, gtr.orb, min_facing=0.6)
+    for k_ in range(1, 37):
+        _, cov_ = gtr.tour_step(GB.render_synthetic(gA_, R0_t @ GB.rot_z(10 * k_), (Hg, Wg, 3), seed=k_, texture=tex_g),
+                                now=float(k_))
+    ok_t = cov_ >= 0.9
+    print(f"   тур (повний оберт кроками по 10°): вивчено {cov_ * 100:.0f}%, пам'ять {len(gtr.memory)} точок "
+          f"{'OK' if ok_t else 'FAIL'}")
+    tilt_ = cv2.Rodrigues(np.array([0.05, 0.0, np.radians(12)]))[0]
+    gB_ = GB.GlobeGeometry((470, 330), 300, GB.fov_to_f(62, Wg), (Wg, Hg))
+    found, errs_o, times_o = 0, [], []
+    for th_ in range(0, 360, 30):
+        Rb = tilt_ @ R0_t @ GB.rot_z(th_)
+        fr_ = GB.render_synthetic(gB_, Rb, (Hg, Wg, 3), seed=100 + th_, texture=tex_g)
+        gtr.locked = False
+        if hasattr(gtr, "_last_circle"):
+            del gtr._last_circle
+        t0_ = time.perf_counter(); gtr.update(fr_, now=1000.0 + th_); times_o.append((time.perf_counter() - t0_) * 1000)
+        e_ = np.degrees(np.arccos(np.clip((np.trace(mdl.R().T @ Rb) - 1) / 2, -1, 1)))
+        found += gtr.status == "tracked" and e_ < 5
+        errs_o.append(e_)
+    ok_m = found >= 11 and np.median(errs_o) < 1.5
+    print(f"   глобус переставили, наблизили, нахилили на 12°: розпізнано з нуля {found}/12 боків, "
+          f"похибка орієнтації медіана {np.median(errs_o):.2f}°, {np.mean(times_o):.0f} мс/кадр {'OK' if ok_m else 'FAIL'}")
+    ov2 = fr_.copy(); GB.GlobeOverlay(mdl).draw(ov2, gtr.status); cv2.imwrite(str(out / "selftest_globe_moved.png"), ov2)
+    ok_all &= ok_t and ok_m
+
+    hg = SP.help_announcement(KEYS_GLOBE, len(specs), "globe")
+    ok_hg = "глобус" in hg and "Лівим" not in hg and "кома і крапка" in hg
+    print(f"   довідка для глобуса: про глобус, без лівої руки, час клавішами {'OK' if ok_hg else 'FAIL'}")
+    ok_all &= ok_c and ok_o and ok_s and ok_f and ok_hg
+
     print("\n6) Сонифікація (синтез без звукової карти):")
     sr = Sonifier.SR
     base_layer = by.get("sst") or next(iter(by.values()))
@@ -1576,6 +1924,8 @@ def main():
     ap.add_argument("--projection", default="equirect", choices=PROJECTIONS,
                     help="проєкція, якщо клацнуто лише 4 місця")
     ap.add_argument("--lon0", type=float, default=0.0, help="центральний меридіан карти, якщо 4 місця")
+    ap.add_argument("--surface", default="map", choices=["map", "globe"],
+                    help="map - паперова карта (як раніше), globe - глобус на підставці з віссю")
     ap.add_argument("--track", default="features", choices=["features", "contour", "static"],
                     help="як відстежувати карту: features - за малюнком карти (за замовчуванням), "
                          "contour - за краями аркуша, static - карта нерухома")
@@ -1608,6 +1958,16 @@ def main():
     try:
         frame = _read(cap)
         scale = min(1.0, args.view / frame.shape[1])
+        if args.surface == "globe":
+            loaded = None if args.recalibrate else GB.load_globe()
+            if loaded and tuple(loaded[0].geom.to_dict()["frame_wh"]) != (frame.shape[1], frame.shape[0]):
+                print("Розмір кадру камери змінився з часу калібрування глобуса - потрібне нове калібрування.")
+                loaded = None
+            if loaded:
+                print(f"Калібрування глобуса з {GB.GLOBE_CALIB.name}. (--recalibrate щоб переробити)")
+            globe = GlobeSurface(*loaded) if loaded else run_globe_calibration(cap, args, scale)
+            run_tracking(cap, None, specs, args, scale, globe=globe)
+            return
         cal = MapCalibration.load(CALIB_FILE) if CALIB_FILE.exists() and not args.recalibrate else None
         if cal is None:
             if CALIB_FILE.exists() and not args.recalibrate:

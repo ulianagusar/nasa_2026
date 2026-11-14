@@ -15,6 +15,8 @@ __pycache__/
 # --- калібрування камери: залежить від того, де стоїть камера і лежить карта ---
 calibration.json
 calibration_template.png
+globe_calibration.json
+globe_memory.npz
 
 # --- великі дані, завантажуються окремо (див. команди нижче) ---
 # NOAA ERSST v5, ~160 МБ (GitHub не приймає файли > 100 МБ):
