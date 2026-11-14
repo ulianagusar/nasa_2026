@@ -1,4 +1,7 @@
-"""Палець на паперовій карті -> температура океану (NOAA ERSST v5).
+"""Палець на паперовій карті -> значення обраного шару даних (температура океану,
+аномалія температури, CO2, ... - див. LAYERS.md) -> панель, карта і звук.
+
+Шари: клавіші l / 1-9 у вікні; для шарів з роками , . (±1 рік), < > (±10), p (відтворення).
 
 Камера дивиться на роздруковану карту світу. Програма:
   * відстежує карту за її власним малюнком (ORB-точки + гомографія), без фізичних
@@ -32,15 +35,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import layers as L
+
 HERE = Path(__file__).resolve().parent
 CALIB_FILE = HERE / "calibration.json"
 CALIB_VERSION = 3
 TEMPLATE_FILE = HERE / "calibration_template.png"
 MODEL_FILE = HERE / "models" / "hand_landmarker.task"
-SST_FILE = HERE / "sst.mnmean.nc"
-COAST_FILE = HERE / "data" / "ne_50m_land.geojson"
 INDEX_TIP = 8  # MediaPipe: кінчик вказівного пальця
-WIN_CAM, WIN_SST = "Earth Map", "Ocean Temperature"
+WIN_CAM, WIN_SST = "Earth Map", "Data Layer"
 
 # Впізнавані точки для калібрування: (назва для вікна, назва для консолі, lat, lon)
 LANDMARKS = [
@@ -60,19 +63,6 @@ CORNER_NAMES = [("TOP-LEFT", "верхній лівий"), ("TOP-RIGHT", "вер
 # Кольори (RGB для PIL / matplotlib)
 SURFACE, INK, INK2, MUTED, GRIDC, LANDC = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#d6d5cf"
 WARM, COOL = "#d03b3b", "#256abf"
-SST_VMIN, SST_VMAX = -2.0, 32.0
-
-
-def sst_cmap():
-    from matplotlib.colors import LinearSegmentedColormap
-    cm = LinearSegmentedColormap.from_list("sst", ["#fdeee4", "#f6b48f", "#eb6834", "#b7461c", "#6e2509"])
-    cm.set_bad(LANDC)
-    return cm
-
-
-def hex_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
 # ----------------------------------------------------------------------------
@@ -570,231 +560,132 @@ def capture_template(cap, corners):
 
 
 # ----------------------------------------------------------------------------
-# Дані температури
+# Звіт у консоль і панель з живим значенням шару (PIL, щоб була кирилиця)
 # ----------------------------------------------------------------------------
-MONTHS_UA = ["січень", "лютий", "березень", "квітень", "травень", "червень", "липень",
-             "серпень", "вересень", "жовтень", "листопад", "грудень"]
+ROLE_COLORS = {"ink": INK, "ink2": INK2, "muted": MUTED, "warm": WARM, "cool": COOL}
 
 
-class SSTLookup:
-    def __init__(self, path, month=None):
-        import xarray as xr
-        ds = xr.open_dataset(path, engine="h5netcdf")
-        t = ds.time.values
-        ti = len(t) - 1 if month is None else int(np.argmin(np.abs(t - np.datetime64(month + "-01"))))
-        self.date = ds.time.values[ti]
-        m = int(str(self.date)[5:7])
-        self.label = f"{MONTHS_UA[m - 1]} {str(self.date)[:4]}"
-        self.label_en = f"{str(self.date)[:4]}-{m:02d}"
-        self.cur = ds.sst.isel(time=ti).values
-        base = ds.sst.sel(time=slice("1971", "2000"))
-        self.base = base.sel(time=base["time.month"] == m).mean("time").values
-        self.lat = ds.lat.values.astype(float)
-        self.lon = ds.lon.values.astype(float)  # 0..358
-        ds.close()
-
-    def at(self, lat, lon, search_cells=3):
-        i = int(np.argmin(np.abs(self.lat - lat)))
-        j = int(np.argmin(np.abs(wrap180(self.lon - lon))))
-        if not np.isnan(self.cur[i, j]):
-            return {"land": False, "t": float(self.cur[i, j]), "base": float(self.base[i, j]), "dist_km": 0.0}
-        best = None  # суша -> найближча клітинка з водою
-        n = len(self.lon)
-        for di in range(-search_cells, search_cells + 1):
-            for dj in range(-search_cells, search_cells + 1):
-                ii, jj = i + di, (j + dj) % n
-                if 0 <= ii < len(self.lat) and not np.isnan(self.cur[ii, jj]):
-                    d = float(haversine_km(lat, lon, self.lat[ii], self.lon[jj]))
-                    if best is None or d < best[0]:
-                        best = (d, ii, jj)
-        if best is None:
-            return {"land": True, "t": None}
-        d, ii, jj = best
-        return {"land": True, "t": float(self.cur[ii, jj]), "base": float(self.base[ii, jj]), "dist_km": d}
+def report(layer, year, lat, lon, s):
+    where = "вся планета" if not layer.spatial else L.fmt_coord(lat, lon)
+    head = f"[{datetime.now():%H:%M:%S}] {where} · {layer.title}, {layer.time_label(year)}"
+    if s is None or s["missing"]:
+        return f"{head} -> {layer.missing_label}"
+    extra = [t for t, role in s["lines"] if role in ("ink2", "warm", "cool")]
+    return f"{head} -> {s['text']}" + (" | " + " | ".join(extra) if extra else "")
 
 
-def fmt_coord(lat, lon):
-    return f"{abs(lat):.1f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.1f}°{'E' if lon >= 0 else 'W'}"
+def _wrap_px(d, text, font, width):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        test = f"{cur} {w}".strip()
+        if cur and d.textlength(test, font=font) > width:
+            lines.append(cur); cur = w
+        else:
+            cur = test
+    return lines + [cur] if cur else lines
 
 
-def report(lat, lon, sst):
-    r = sst.at(lat, lon)
-    head = f"[{datetime.now():%H:%M:%S}] {fmt_coord(lat, lon)}"
-    if r["t"] is None:
-        return f"{head} -> суша, води поблизу немає"
-    tail = f"{r['t']:.1f} °C ({sst.label})"
-    if not np.isnan(r["base"]):
-        tail += f" | норма 1971–2000: {r['base']:.1f} °C ({r['t'] - r['base']:+.1f} °C)"
-    if r["land"]:
-        return f"{head} -> суша. Найближча вода (~{r['dist_km']:.0f} км): {tail}"
-    return f"{head} -> {tail}"
-
-
-# ----------------------------------------------------------------------------
-# Панель з живою температурою (PIL, щоб була кирилиця)
-# ----------------------------------------------------------------------------
 class Panel:
-    def __init__(self, width, sst):
-        from matplotlib import font_manager
-        from PIL import ImageFont
-        fp = font_manager.FontProperties(family="DejaVu Sans")
-        regular = font_manager.findfont(fp)
-        bold = font_manager.findfont(font_manager.FontProperties(family="DejaVu Sans", weight="bold"))
-        self.f_xs = ImageFont.truetype(regular, 13)
-        self.f_s = ImageFont.truetype(regular, 16)
-        self.f_m = ImageFont.truetype(bold, 20)
-        self.f_xl = ImageFont.truetype(bold, 50)
-        self.w, self.sst = width, sst
-        lut = (sst_cmap()(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+    def __init__(self, width):
+        self.w = width
+        self.f = L.get_fonts()
         self.bar_w = width - 40
-        self.bar = np.repeat(lut[np.linspace(0, 255, self.bar_w).astype(int)][None], 14, axis=0)
+        self._bars = {}
+
+    def _bar(self, layer):
+        if layer.name not in self._bars:
+            self._bars[layer.name] = np.repeat(layer.lut[np.linspace(0, 255, self.bar_w).astype(int)][None], 14, axis=0)
+        return self._bars[layer.name]
+
+    def _text(self, d, x, y, text, font, role, width, lh, max_lines=2):
+        for line in _wrap_px(d, text, font, width)[:max_lines]:
+            d.text((x, y), line, font=font, fill=L.hex_rgb(ROLE_COLORS[role])); y += lh
+        return y
 
     def render(self, height, info):
         from PIL import Image, ImageDraw
-        img = Image.new("RGB", (self.w, height), hex_rgb(SURFACE))
+        layer, s = info["layer"], info.get("sample")
+        img = Image.new("RGB", (self.w, height), L.hex_rgb(SURFACE))
         d = ImageDraw.Draw(img)
-        x, y = 20, 16
-        d.text((x, y), "ПІД ПАЛЬЦЕМ", font=self.f_xs, fill=hex_rgb(MUTED)); y += 22
-        if info.get("state") == "ok":
-            d.text((x, y), fmt_coord(info["lat"], info["lon"]), font=self.f_m, fill=hex_rgb(INK)); y += 34
-            r = info["r"]
-            if r["t"] is None:
-                d.text((x, y), "суша", font=self.f_xl, fill=hex_rgb(INK2)); y += 66
-                d.text((x, y), "поблизу немає даних про воду", font=self.f_s, fill=hex_rgb(INK2)); y += 26
+        x, y, W = 20, 14, self.w - 40
+        col = lambda role: L.hex_rgb(ROLE_COLORS[role])
+        n = info["n_layers"]
+        d.text((x, y), f"ШАР {info['layer_idx']}/{n}  ·  l або 1–{min(n, 9)}: змінити", font=self.f["xs"],
+               fill=col("muted")); y += 20
+        y = self._text(d, x, y, layer.title, self.f["l"], "ink", W, 22)
+        if layer.years is not None:
+            d.text((x, y), f"рік {layer.time_label(info['year'])}" + ("   ▶ відтворення" if info.get("playing") else ""),
+                   font=self.f["s"], fill=col("ink2")); y += 22
+            d.text((x, y), ", .  рік ±1    < >  ±10    p  ▶/❚❚", font=self.f["xs"], fill=col("muted")); y += 20
+        else:
+            d.text((x, y), layer.time_label(None), font=self.f["s"], fill=col("ink2")); y += 22
+        y += 4
+        d.line([(x, y), (self.w - 20, y)], fill=L.hex_rgb(GRIDC)); y += 10
+
+        if not layer.spatial:
+            d.text((x, y), "ВСЯ ПЛАНЕТА (від місця не залежить)", font=self.f["xs"], fill=col("muted")); y += 22
+        else:
+            d.text((x, y), "ПІД ПАЛЬЦЕМ", font=self.f["xs"], fill=col("muted")); y += 20
+            if info.get("pos"):
+                d.text((x, y), L.fmt_coord(*info["pos"]), font=self.f["m"], fill=col("ink")); y += 28
+        if s is not None:
+            if s["missing"]:
+                d.text((x, y), layer.missing_label, font=self.f["xl"], fill=col("ink2")); y += 60
             else:
-                d.text((x, y), f"{r['t']:.1f} °C", font=self.f_xl, fill=hex_rgb(INK)); y += 66
-                if r["land"]:
-                    d.text((x, y), f"суша: найближча вода ~{r['dist_km']:.0f} км", font=self.f_s,
-                           fill=hex_rgb(INK2)); y += 24
-                if not np.isnan(r["base"]):
-                    an = r["t"] - r["base"]
-                    d.text((x, y), f"норма 1971–2000: {r['base']:.1f} °C", font=self.f_s, fill=hex_rgb(INK2)); y += 24
-                    d.text((x, y), f"аномалія: {an:+.1f} °C", font=self.f_m,
-                           fill=hex_rgb(WARM if an > 0.05 else COOL if an < -0.05 else INK2)); y += 30
+                d.text((x, y), s["text"], font=self.f["xl"], fill=col("ink")); y += 60
+                for t, role in s["lines"]:
+                    small = role == "muted"
+                    y = self._text(d, x, y, t, self.f["xs"] if small else self.f["s"], role, W, 18 if small else 22)
         else:
             msg = {"nohand": "руку не видно", "offmap": "палець поза картою"}.get(info.get("state"), "")
-            d.text((x, y), msg, font=self.f_m, fill=hex_rgb(INK2)); y += 34 + 66 + 78
-        # шкала температури з маркером
-        y = max(y + 8, 230)
-        img.paste(Image.fromarray(self.bar), (x, y))
-        r = info.get("r")
-        if info.get("state") == "ok" and r and r["t"] is not None:
-            px = x + int(np.clip((r["t"] - SST_VMIN) / (SST_VMAX - SST_VMIN), 0, 1) * (self.bar_w - 1))
-            d.polygon([(px - 6, y - 9), (px + 6, y - 9), (px, y - 1)], fill=hex_rgb(INK))
-        for v in (SST_VMIN, 15, SST_VMAX):
-            px = x + int((v - SST_VMIN) / (SST_VMAX - SST_VMIN) * (self.bar_w - 1))
-            d.text((px - 10, y + 17), f"{v:.0f}°", font=self.f_xs, fill=hex_rgb(MUTED))
-        y += 46
-        d.line([(x, y), (self.w - 20, y)], fill=hex_rgb(GRIDC)); y += 10
-        d.text((x, y), f"Дані: {self.sst.label}, NOAA ERSST v5", font=self.f_xs, fill=hex_rgb(INK2)); y += 20
+            d.text((x, y), msg, font=self.f["m"], fill=col("ink2")); y += 40
+
+        y += 12                                                # шкала шару з маркером
+        img.paste(Image.fromarray(self._bar(layer)), (x, y))
+        if s is not None and not s["missing"]:
+            px = x + int(s["norm"] * (self.bar_w - 1))
+            d.polygon([(px - 6, y - 9), (px + 6, y - 9), (px, y - 1)], fill=col("ink"))
+        for v in (layer.vmin, (layer.vmin + layer.vmax) / 2, layer.vmax):
+            px = x + int((v - layer.vmin) / (layer.vmax - layer.vmin) * (self.bar_w - 1))
+            t = layer.fmt.format(v)
+            tx = min(max(px - d.textlength(t, font=self.f["xs"]) / 2, x), x + self.bar_w - d.textlength(t, font=self.f["xs"]))
+            d.text((tx, y + 17), t, font=self.f["xs"], fill=col("muted"))
+        y += 42
+        d.line([(x, y), (self.w - 20, y)], fill=L.hex_rgb(GRIDC)); y += 10
+
+        if layer.source:
+            y = self._text(d, x, y, f"Дані: {layer.source}", self.f["xs"], "ink2", W, 17)
         st = {"tracked": "знайдено", "held": "утримуються (карту не видно)", "searching": "пошук карти...",
               "static": "фіксовані"}[info.get("sheet", "static")]
         if info.get("inliers") and info.get("sheet") == "tracked":
             st += f" ({info['inliers']} точок)"
-        d.text((x, y), f"Кути карти: {st}", font=self.f_xs, fill=hex_rgb(INK2)); y += 20
+        d.text((x, y), f"Карта: {st}", font=self.f["xs"], fill=col("ink2")); y += 18
         snd = "вимкнено (m)" if info.get("muted") else (f"нота {info['note']}" if info.get("note") else "тиша")
-        d.text((x, y), f"Звук: {snd}", font=self.f_xs, fill=hex_rgb(INK2)); y += 26
-        # прогрес фіксації
+        d.text((x, y), f"Звук: {snd}", font=self.f["xs"], fill=col("ink2")); y += 24
         frac = info.get("dwell", 0.0)
-        d.text((x, y), "Фіксація в консоль (3 с)", font=self.f_xs, fill=hex_rgb(INK2)); y += 18
-        d.rectangle([x, y, self.w - 20, y + 8], fill=hex_rgb(GRIDC))
+        d.text((x, y), "Фіксація в консоль (3 с)", font=self.f["xs"], fill=col("ink2")); y += 18
+        d.rectangle([x, y, self.w - 20, y + 8], fill=L.hex_rgb(GRIDC))
         if frac > 0:
-            d.rectangle([x, y, x + int((self.w - 40) * frac), y + 8], fill=hex_rgb("#0ca30c" if frac >= 1 else "#eb6834"))
-        y += 22
+            d.rectangle([x, y, x + int(W * frac), y + 8], fill=L.hex_rgb("#0ca30c" if frac >= 1 else "#eb6834"))
+        y += 20
         if info.get("last_fix"):
-            d.text((x, y), "Остання фіксація:", font=self.f_xs, fill=hex_rgb(MUTED)); y += 18
-            for line in _wrap(info["last_fix"], 38)[:4]:
-                d.text((x, y), line, font=self.f_xs, fill=hex_rgb(INK)); y += 17
-        d.text((x, height - 24), "q вихід · c калібр. · k кути · m звук", font=self.f_xs, fill=hex_rgb(MUTED))
+            d.text((x, y), "Остання фіксація:", font=self.f["xs"], fill=col("muted")); y += 18
+            self._text(d, x, y, info["last_fix"], self.f["xs"], "ink", W, 17, max_lines=4)
+        d.text((x, height - 24), "q вихід · c калібр. · k кути · m звук", font=self.f["xs"], fill=col("muted"))
         return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
 
 
-def _wrap(text, n):
-    words, lines, cur = text.split(), [], ""
-    for w in words:
-        if len(cur) + len(w) + 1 > n:
-            lines.append(cur); cur = w
-        else:
-            cur = f"{cur} {w}".strip()
-    return lines + [cur] if cur else lines
-
-
 # ----------------------------------------------------------------------------
-# Вікно з картою температури, де точка повторює рух пальця
-# ----------------------------------------------------------------------------
-class SSTMapView:
-    def __init__(self, sst, width_in=10.0):
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-        from matplotlib.collections import LineCollection
-        from matplotlib.figure import Figure
-        fig = Figure(figsize=(width_in, width_in * 0.56), dpi=100, facecolor=SURFACE)
-        canvas = FigureCanvasAgg(fig)
-        ax = fig.add_axes([0.04, 0.17, 0.92, 0.73])
-        data = np.roll(sst.cur, -int(np.argmin(np.abs(sst.lon - 180))), axis=1)  # lon 0..358 -> -180..178
-        im = ax.imshow(np.ma.masked_invalid(data), extent=[-181, 179, -89, 89], cmap=sst_cmap(),
-                       vmin=SST_VMIN, vmax=SST_VMAX, interpolation="nearest")
-        if COAST_FILE.exists():
-            land = json.loads(COAST_FILE.read_text())
-            segs = []
-            for f in land["features"]:
-                g = f["geometry"]
-                for p in ([g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]):
-                    segs.append(np.asarray(p[0]))
-            ax.add_collection(LineCollection(segs, colors=INK2, linewidths=0.4))
-        ax.set_facecolor(LANDC)
-        ax.set_xlim(-180, 180); ax.set_ylim(-90, 90); ax.set_aspect("equal")
-        ax.set_xticks(range(-180, 181, 60)); ax.set_yticks(range(-90, 91, 30))
-        ax.tick_params(colors=MUTED, labelsize=8)
-        for s in ax.spines.values():
-            s.set_color(GRIDC)
-        ax.set_title(f"Температура поверхні океану, {sst.label} (NOAA ERSST v5)",
-                     fontsize=13, fontweight="bold", color=INK, loc="left")
-        cb = fig.colorbar(im, cax=fig.add_axes([0.3, 0.07, 0.4, 0.03]), orientation="horizontal")
-        cb.set_label("°C", color=INK2); cb.ax.tick_params(colors=MUTED, labelsize=8); cb.outline.set_visible(False)
-        canvas.draw()
-        self.base = cv2.cvtColor(np.asarray(canvas.buffer_rgba()), cv2.COLOR_RGBA2BGR)
-        H = self.base.shape[0]
-        (x0, y0), (x1, y1) = ax.transData.transform([(-180, 90), (180, -90)])
-        self.x0, self.y0, self.x1, self.y1 = x0, H - y0, x1, H - y1
-
-    def to_px(self, lat, lon):
-        return (int(round(self.x0 + (lon + 180) / 360 * (self.x1 - self.x0))),
-                int(round(self.y0 + (90 - lat) / 180 * (self.y1 - self.y0))))
-
-    def render(self, lat=None, lon=None, trail=(), dwell=0.0, temp=None):
-        img = self.base.copy()
-        pts = list(trail)
-        for (la1, lo1), (la2, lo2) in zip(pts, pts[1:]):
-            if abs(lo2 - lo1) < 90:  # не малюємо лінію через лінію зміни дат
-                cv2.line(img, self.to_px(la1, lo1), self.to_px(la2, lo2), (120, 120, 120), 2, cv2.LINE_AA)
-        if lat is not None:
-            p = self.to_px(lat, lon)
-            cv2.circle(img, p, 11, (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.circle(img, p, 7, (20, 20, 20), -1, cv2.LINE_AA)
-            if dwell > 0:
-                col = (12, 163, 12) if dwell >= 1 else (52, 104, 235)
-                cv2.ellipse(img, p, (18, 18), -90, 0, 360 * min(dwell, 1.0), col, 3, cv2.LINE_AA)
-            label = "land" if temp is None else f"{temp:.1f} C"
-            cv2.putText(img, label, (p[0] + 22, p[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 4, cv2.LINE_AA)
-            cv2.putText(img, label, (p[0] + 22, p[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 2, cv2.LINE_AA)
-        return img
-
-
-# ----------------------------------------------------------------------------
-# Трекінг пальця
-# ----------------------------------------------------------------------------
-# ----------------------------------------------------------------------------
-# Сонифікація: температура -> звук у реальному часі
+# Сонифікація: значення будь-якого шару -> звук у реальному часі
 # ----------------------------------------------------------------------------
 PENTATONIC = [0, 2, 4, 7, 9]           # мажорна пентатоніка: будь-які дві ноти звучать злагоджено
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
-def temp_to_midi(t, lo=SST_VMIN, hi=SST_VMAX, midi_lo=48, midi_hi=76):
-    """Температура -> нота пентатоніки між C3 (холодно) і E5 (тепло)."""
+def norm_to_midi(norm, midi_lo=48, midi_hi=76):
+    """Нормоване значення шару 0..1 (vmin..vmax) -> нота пентатоніки між C3 (низько) і E5 (високо)."""
     scale = [m for m in range(midi_lo, midi_hi + 1) if (m - midi_lo) % 12 in PENTATONIC]
-    k = int(round(np.clip((t - lo) / (hi - lo), 0, 1) * (len(scale) - 1)))
-    return scale[k]
+    return scale[int(round(np.clip(norm, 0, 1) * (len(scale) - 1)))]
 
 
 def midi_to_hz(m):
@@ -806,11 +697,12 @@ def midi_name(m):
 
 
 class Sonifier:
-    """Адитивний синтезатор, параметри якого задають дані:
-      температура  -> висота ноти (пентатоніка) і яскравість тембру (кількість гармонік);
-      аномалія     -> биття (другий голос розстроєний) і пульсація-"серцебиття" при потеплінні;
-      довгота      -> стерео-панорама (захід ліворуч, схід праворуч);
-      суша         -> тихий шум; фіксація -> дзвіночок.
+    """Адитивний синтезатор, параметри якого задають дані будь-якого шару:
+      значення (norm 0..1)  -> висота ноти (пентатоніка) і яскравість тембру (кількість гармонік);
+      напруга (tension)     -> наскільки значення вище/нижче базового рівня шару (норми):
+                               биття (другий голос розстроєний) і пульсація-"серцебиття", коли вище;
+      довгота               -> стерео-панорама (захід ліворуч, схід праворуч);
+      немає даних           -> тихий шум; фіксація -> дзвіночок.
     Усі зміни плавні (портаменто/згладжування), щоб не було клацань.
     render() працює і без звукової карти (для запису WAV і тестів)."""
     SR = 44100
@@ -838,22 +730,22 @@ class Sonifier:
                 print(f"  Звук вимкнено: {e}")
 
     # --- керування з головного потоку ---
-    def water(self, temp, anomaly, lon, quiet=False):
-        m = temp_to_midi(temp)
+    def play(self, norm, tension, lon, quiet=False):
+        """norm: 0..1 у шкалі шару; tension: (значення - базовий рівень) / масштаб шару, ~1 = сильне відхилення."""
+        m = norm_to_midi(norm)
         self.note = m
-        tnorm = float(np.clip((temp - SST_VMIN) / (SST_VMAX - SST_VMIN), 0, 1))
-        an = 0.0 if anomaly is None or np.isnan(anomaly) else float(anomaly)
+        tn = 0.0 if tension is None or np.isnan(tension) else float(tension)
         self.target.update(
             freq=midi_to_hz(m),
             amp=0.45 if quiet else 1.0,
             noise=0.15 if quiet else 0.0,
-            bright=2.4 - 1.5 * tnorm,                       # менший показник = більше гармонік = яскравіше
-            detune=float(np.clip(abs(an) * 2.0, 0, 8)),     # Гц биття між двома голосами
-            prate=float(np.clip(1.0 + max(an, 0) * 2.5, 1, 7)),
-            pdepth=float(np.clip(max(an, 0) / 2.5, 0, 0.75)),
+            bright=2.4 - 1.5 * float(np.clip(norm, 0, 1)),  # менший показник = більше гармонік = яскравіше
+            detune=float(np.clip(abs(tn) * 5.0, 0, 8)),     # Гц биття між двома голосами
+            prate=float(np.clip(1.0 + max(tn, 0) * 6.0, 1, 7)),
+            pdepth=float(np.clip(max(tn, 0), 0, 0.75)),
             pan=float(np.clip(lon / 180.0, -1, 1)))
 
-    def land(self, lon):
+    def missing(self, lon):
         self.note = None
         self.target.update(amp=0.0, noise=0.35, pan=float(np.clip(lon / 180.0, -1, 1)))
 
@@ -931,20 +823,28 @@ def make_landmarker():
     return mp, vision.HandLandmarker.create_from_options(opts)
 
 
-def run_tracking(cap, cal, sst, args, scale):
+def run_tracking(cap, cal, specs, args, scale):
     mp, landmarker = make_landmarker()
     frame = _read(cap)
     tracker = make_tracker(args.track, cal, frame.shape)
     finger = OneEuro()
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
+    panel, view = Panel(340), L.LayerView()
+    names = [s.name for s in specs]
+    li = names.index(args.layer) if args.layer in names else 0
+    layer = specs[li].load()
+    year = layer.clamp_year(args.year)
+    playing, last_step = False, 0.0
+
+    print("=== ТРЕКІНГ === Шари даних:")
+    for k, s in enumerate(specs, 1):
+        print(f"   {k}. {s.title} [{s.kind}]" + ("   <- зараз" if k - 1 == li else ""))
+    print("   Клавіші у вікні: l / 1-9 - шар, , . - рік ±1, < > - ±10, p - відтворення років,")
+    print(f"   m - звук, q - вихід, c - калібрування, k - кути. Палець {args.dwell:.0f} с на місці -> запис сюди.")
     if son.stream is not None:
-        print("Звук: висота = температура (пентатоніка), яскравість = тепло, биття і пульсація = наскільки")
-        print("      тепліше норми 1971–2000, ліво/право = довгота, шум = суша, дзвіночок = фіксація. m - вимкнути звук.")
-    panel = Panel(330, sst)
-    view = SSTMapView(sst)
-    print(f"=== ТРЕКІНГ === Дані: {sst.label}. Панель і карта оновлюються наживо;")
-    print(f"    якщо тримати палець {args.dwell:.0f} с на місці, точка запишеться сюди в консоль.")
-    print("    У вікні: q - вийти, c - перекалібрувати все, k - заново позначити кути аркуша.\n")
+        print("   Звук: висота = значення шару (пентатоніка), биття і пульсація = наскільки вище базового")
+        print("   рівня (норми), ліво/право = довгота, шум = немає даних, дзвіночок = фіксація.\n")
+
     cv2.namedWindow(WIN_CAM, cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow(WIN_SST, cv2.WINDOW_NORMAL)
     placed = False
@@ -952,11 +852,24 @@ def run_tracking(cap, cal, sst, args, scale):
     trail = deque(maxlen=40)
     last_fix = ""
     t0, last_ts = time.monotonic(), -1
+
+    def switch(new_li):
+        nonlocal li, layer, year
+        li = new_li % len(specs)
+        print(f"Шар {li + 1}/{len(specs)}: {specs[li].title} (завантаження...)")
+        prev_year = year
+        layer = specs[li].load()
+        year = layer.clamp_year(prev_year)
+        trail.clear()
+
     while True:
         frame = _read(cap)
         h, w = frame.shape[:2]
         now = time.monotonic()
         ts = max(int((now - t0) * 1000), last_ts + 1); last_ts = ts
+        if playing and layer.years is not None and now - last_step >= args.step:
+            last_step = now
+            year = year + 1 if year < layer.years[-1] else int(layer.years[0])
 
         corners = tracker.update(frame)
         G = cam_to_sheet_H(corners)
@@ -965,72 +878,81 @@ def run_tracking(cap, cal, sst, args, scale):
             mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), ts)
         if res.hand_landmarks:
             lm = res.hand_landmarks[0][INDEX_TIP]
-            tip = np.array([lm.x * w, lm.y * h])
-            smooth = finger(tip, now).copy()
+            smooth = finger(np.array([lm.x * w, lm.y * h]), now).copy()
             last_seen = now
         elif now - last_seen > 0.4:  # руку загублено
             smooth, anchor, fired = None, None, False
             finger.reset()
 
         info = {"state": "nohand", "sheet": tracker.status, "dwell": 0.0, "last_fix": last_fix,
-                "inliers": getattr(tracker, "inliers", None)}
-        lat = lon = temp = None
+                "inliers": getattr(tracker, "inliers", None), "layer": layer, "layer_idx": li + 1,
+                "n_layers": len(specs), "year": year, "playing": playing}
+        lat = lon = None
+        frac = 0.0
         if smooth is not None:
             u, v = apply_H(G, [smooth])[0]
             on_sheet = -0.02 <= u <= 1.02 and -0.02 <= v <= 1.02
             lat, lon, ok = cal.sheet_to_latlon(u, v)
-            inside = ok and on_sheet
-            radius = args.radius * max(w, h)
-            if anchor is None or np.hypot(*(smooth - anchor)) > radius:
+            if anchor is None or np.hypot(*(smooth - anchor)) > args.radius * max(w, h):
                 anchor, anchor_t, fired = smooth.copy(), now, False
             frac = min(1.0, (now - anchor_t) / args.dwell)
             info["dwell"] = frac
-            if inside:
-                r = sst.at(lat, lon)
-                temp = r["t"] if not r["land"] else (None if r["t"] is None else r["t"])
-                info.update(state="ok", lat=lat, lon=lon, r=r)
+            if ok and on_sheet:
+                info.update(state="ok", pos=(lat, lon))
                 trail.append((lat, lon))
-                if frac >= 1.0 and not fired:
-                    fired = True
-                    last_fix = report(lat, lon, sst)
-                    print(last_fix)
-                    son.chime()
             else:
                 info["state"] = "offmap"
                 lat = lon = None
-                if frac >= 1.0 and not fired:
-                    fired = True
-                    print(f"[{datetime.now():%H:%M:%S}] палець поза картою")
             col = (12, 163, 12) if fired else (52, 104, 235)
             c = (int(smooth[0]), int(smooth[1]))
             cv2.circle(frame, c, 7, col, -1)
             cv2.ellipse(frame, c, (24, 24), -90, 0, 360 * frac, col, 3)
 
-        # ---- звук ----
-        if info["state"] == "ok":
-            r = info["r"]
-            if r["t"] is None:
-                son.land(info["lon"])
-            else:
-                son.water(r["t"], r["t"] - r["base"], info["lon"], quiet=r["land"])
+        if layer.spatial:
+            s = layer.sample(lat, lon, year) if lat is not None else None
         else:
+            s = layer.sample(0.0, 0.0, year)                   # крива: значення однакове для всієї планети
+        info["sample"] = s
+
+        if smooth is not None and frac >= 1.0 and not fired:
+            fired = True
+            if s is not None:
+                last_fix = report(layer, year, lat, lon, s)
+                print(last_fix)
+                son.chime()
+            else:
+                print(f"[{datetime.now():%H:%M:%S}] палець поза картою")
+
+        # ---- звук ----
+        pan_lon = lon if lon is not None else 0.0
+        if s is None:
             son.silence()
+        elif s["missing"]:
+            son.missing(pan_lon)
+        else:
+            son.play(s["norm"], s["tension"], pan_lon, quiet=bool(s["near_km"]))
         info["note"] = None if son.note is None else f"{midi_name(son.note)} · {midi_to_hz(son.note):.0f} Гц"
         info["muted"] = son.muted or son.stream is None
 
         qcol = {"tracked": (0, 200, 0), "held": (0, 200, 255), "searching": (0, 0, 255), "static": (200, 200, 200)}
         cv2.polylines(frame, [np.int32(corners)], True, qcol[tracker.status], 2)
-        for k, p in enumerate(corners):
+        for p in corners:
             cv2.circle(frame, (int(p[0]), int(p[1])), 6, qcol[tracker.status], -1)
 
         cam = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        cv2.imshow(WIN_CAM, np.hstack([cam, panel.render(cam.shape[0], info)]))
-        sst_img = view.render(lat, lon, trail, info["dwell"] if lat is not None else 0.0, temp)
-        cv2.imshow(WIN_SST, sst_img)
+        ph = max(cam.shape[0], 700)
+        if cam.shape[0] < ph:                                  # панель вища за камеру -> доповнюємо фоном
+            cam = np.vstack([cam, np.full((ph - cam.shape[0], cam.shape[1], 3), (251, 252, 252), np.uint8)])
+        cv2.imshow(WIN_CAM, np.hstack([cam, panel.render(ph, info)]))
+        label = None if s is None else (layer.missing_label if s["missing"] else s["text"])
+        pos = (lat, lon) if lat is not None else None
+        map_img = view.render(layer, year, pos, trail if layer.spatial else (),
+                              frac if (pos is not None or not layer.spatial) and smooth is not None else 0.0, label)
+        cv2.imshow(WIN_SST, map_img)
         if not placed:
             cv2.moveWindow(WIN_CAM, 0, 0)
-            cv2.resizeWindow(WIN_SST, int(sst_img.shape[1] * 0.8), int(sst_img.shape[0] * 0.8))
-            cv2.moveWindow(WIN_SST, 0, cam.shape[0] + 40)
+            cv2.resizeWindow(WIN_SST, int(map_img.shape[1] * 0.85), int(map_img.shape[0] * 0.85))
+            cv2.moveWindow(WIN_SST, 0, ph + 40)
             placed = True
 
         key = cv2.waitKey(1) & 0xFF
@@ -1038,12 +960,25 @@ def run_tracking(cap, cal, sst, args, scale):
             break
         if key == ord("m"):
             print("Звук вимкнено" if son.toggle_mute() else "Звук увімкнено")
+        if key == ord("l"):
+            switch(li + 1)
+        if ord("1") <= key <= ord("9") and key - ord("1") < len(specs):
+            switch(key - ord("1"))
+        if layer.years is not None:
+            step = {ord(","): -1, ord("."): 1, ord("<"): -10, ord(">"): 10}.get(key)
+            if step:
+                year = layer.clamp_year(year + step)
+            if key == ord("p"):
+                playing = not playing
+                last_step = now
+                print("Відтворення років: " + ("▶" if playing else "пауза"))
         if key == ord("c"):
             son.silence()
             cal = run_calibration(cap, args, scale)
             tracker = make_tracker(args.track, cal, frame.shape)
         if key == ord("k"):
             # ті самі 4 кути заново (напр. змінилось освітлення) -> новий еталон, калібрування місць лишається
+            son.silence()
             corners = pick_corners(cap, scale)
             cal.template = capture_template(cap, corners)
             cv2.destroyWindow("Calibration")
@@ -1191,95 +1126,164 @@ def selftest(args):
     hand = f2
     tracker = ft
 
-    sst = SSTLookup(SST_FILE, args.month)
-    print(f"\n4) Температура ({sst.label}):")
-    for name, la, lo in [("Чорне море", 43.5, 34.0), ("Сахара (суша)", 23.0, 12.0),
-                         ("Одеса (берег)", 46.48, 30.73), ("Екватор, Тихий океан", 0.0, -140.0)]:
-        print(f"   {name:22s} {report(la, lo, sst)}")
+    out = Path(args.selftest_out)
+    out.mkdir(parents=True, exist_ok=True)
 
-    print("\n5) Сонифікація (синтез без звукової карти):")
+    # ---- шари даних ----
+    specs = L.discover_layers(args.month)
+    by = {s.name: s.load() for s in specs}
+    print(f"\n4) Шари даних ({len(specs)}), значення біля Одеси (46.5°N, 30.7°E):")
+    for s in specs:
+        lay = by[s.name]
+        y = lay.default_year()
+        smp = lay.sample(46.48, 30.73, y)
+        print(f"   {s.name:12s} [{s.kind}] {lay.title}, {lay.time_label(y)}: {smp['text']}  "
+              f"(висота {smp['norm']:.2f}, напруга {smp['tension']:+.2f})")
+    if "sst" in by:                       # звірка з NetCDF напряму
+        import xarray as xr
+        ds = xr.open_dataset(L.SST_FILE, engine="h5netcdf")
+        raw = float(ds.sst.sel(lat=46.48, lon=30.73, method="nearest").isel(time=-1)) if args.month is None else None
+        ds.close()
+        if raw is not None:
+            ok = abs(by["sst"].sample(46.48, 30.73)["value"] - raw) < 1e-3
+            ok_all &= ok
+            print(f"   sst == NetCDF напряму ({raw:.2f}): {'OK' if ok else 'FAIL'}")
+    if "temperature" in by:               # звірка зі стисненого .u8.bin з повним .json
+        d = json.loads((L.DATA_DIR / "temperature" / "temperature.json").read_text())
+        yi = d["years"].index(2025)
+        i = int(np.argmin(np.abs(np.array(d["lat"]) - 46.48))); j = int(np.argmin(np.abs(np.array(d["lon"]) - 30.73)))
+        raw = d["data"][yi][i][j]
+        got = by["temperature"].sample(46.48, 30.73, 2025)["value"]
+        ok = abs(got - raw) < 0.011
+        ok_all &= ok
+        print(f"   temperature 2025 == temperature.json ({raw:+.3f} vs {got:+.3f}): {'OK' if ok else 'FAIL'}")
+    if "co2_curve" in by:
+        d = json.loads((L.DATA_DIR / "co2_curve" / "co2_curve.json").read_text())
+        raw = d["values"][d["years"].index(2000)]
+        ok = abs(by["co2_curve"].sample(0, 0, 2000)["value"] - raw) < 1e-6 and 2026 in by["co2_curve"].partial_years
+        ok_all &= ok
+        print(f"   co2_curve 2000 == json ({raw}), 2026 позначено неповним: {'OK' if ok else 'FAIL'}")
+
+    print("\n5) Новий шар з NetCDF (конвертер layers.py from-netcdf), перевірка на sst.mnmean.nc:")
+    if L.SST_FILE.exists():
+        import xarray as xr
+        folder = L.netcdf_to_layer(L.SST_FILE, "sst", "sst_annual_test", out / "layers", title="SST, середнє за рік")
+        lay = L.GridLayer.from_folder(folder)
+        ds = xr.open_dataset(L.SST_FILE, engine="h5netcdf")
+        ann = ds.sst.sel(time=slice("2020", "2020")).mean("time").sel(lat=-30.0, lon=200.0, method="nearest")
+        raw = float(ann); ds.close()
+        got = lay.sample(-30.0, -160.0, 2020)["value"]
+        step = (lay.vmax - lay.vmin) / 254
+        ok = abs(got - raw) <= step
+        ok_all &= ok
+        print(f"   створено {folder.name}/ ({len(lay.years)} років {lay.years[0]}–{lay.years[-1]}); "
+              f"2020, 30°S 160°W: {got:.2f} vs NetCDF {raw:.2f} (крок {step:.3f}) {'OK' if ok else 'FAIL'}")
+        found = [s.name for s in L.discover_layers(data_dir=out / "layers", sst_file=out / "none.nc")]
+        ok = found == ["sst_annual_test"]
+        ok_all &= ok
+        print(f"   автопошук бачить новий шар: {found} {'OK' if ok else 'FAIL'}")
+
+    # ---- звук ----
+    print("\n6) Сонифікація (синтез без звукової карти):")
     sr = Sonifier.SR
+    base_layer = by.get("sst") or next(iter(by.values()))
+    smp = base_layer.sample(46.48, 30.73, base_layer.default_year())
     son = Sonifier(enabled=False)
-    r = sst.at(46.48, 30.73)                                   # Одеса: 18.7 °C, аномалія +2.4
-    son.water(r["t"], 0.0, 30.73)
+    son.play(smp["norm"], 0.0, 30.73)
     son.render(sr // 2)                                         # дати параметрам усталитись
     a = son.render(sr).mean(1)
     spec = np.abs(np.fft.rfft(a * np.hanning(len(a))))
     peak = np.fft.rfftfreq(len(a), 1 / sr)[np.argmax(spec)]
-    want = midi_to_hz(temp_to_midi(r["t"]))
+    want = midi_to_hz(norm_to_midi(smp["norm"]))
     ok_pitch = abs(peak - want) / want < 0.01
-    print(f"   {r['t']:.1f} °C -> нота {midi_name(temp_to_midi(r['t']))} ({want:.1f} Гц), "
+    print(f"   {base_layer.name}: {smp['text']} -> нота {midi_name(norm_to_midi(smp['norm']))} ({want:.1f} Гц), "
           f"виміряно FFT {peak:.1f} Гц  {'OK' if ok_pitch else 'FAIL'}")
-    lo_note, hi_note = midi_name(temp_to_midi(SST_VMIN)), midi_name(temp_to_midi(SST_VMAX))
-    print(f"   діапазон: {SST_VMIN:.0f} °C -> {lo_note}, {SST_VMAX:.0f} °C -> {hi_note}")
+    print(f"   діапазон будь-якого шару: vmin -> {midi_name(norm_to_midi(0))}, vmax -> {midi_name(norm_to_midi(1))}")
 
-    def pulse_ratio(anom):
-        s = Sonifier(enabled=False)
-        s.water(r["t"], anom, 30.73); s.render(sr)
-        x = s.render(2 * sr).mean(1)
-        rms = np.sqrt((x[: len(x) // 882 * 882].reshape(-1, 882) ** 2).mean(1))   # вікна по 20 мс
+    def pulse_ratio(tension):
+        s_ = Sonifier(enabled=False)
+        s_.play(smp["norm"], tension, 30.73); s_.render(sr)
+        x_ = s_.render(2 * sr).mean(1)
+        rms = np.sqrt((x_[: len(x_) // 882 * 882].reshape(-1, 882) ** 2).mean(1))   # вікна по 20 мс
         return rms.max() / max(rms.min(), 1e-9)
-    p0, p2 = pulse_ratio(0.0), pulse_ratio(2.4)
-    ok_pulse = p0 < 1.25 and p2 > 1.8
-    print(f"   пульсація гучності: аномалія 0 -> x{p0:.2f}, аномалія +2.4 °C -> x{p2:.2f}  {'OK' if ok_pulse else 'FAIL'}")
-    s = Sonifier(enabled=False)
-    s.water(20.0, 0.0, -150.0); s.render(sr // 2)
-    st_ = s.render(sr)
+    p0, p1 = pulse_ratio(0.0), pulse_ratio(smp["tension"] if smp["tension"] > 0.5 else 0.96)
+    ok_pulse = p0 < 1.25 and p1 > 1.8
+    print(f"   пульсація гучності: напруга 0 -> x{p0:.2f}, напруга {max(smp['tension'], 0.96):+.2f} -> x{p1:.2f}  "
+          f"{'OK' if ok_pulse else 'FAIL'}")
+    s_ = Sonifier(enabled=False)
+    s_.play(0.5, 0.0, -150.0); s_.render(sr // 2)
+    st_ = s_.render(sr)
     lr = np.sqrt((st_[:, 0] ** 2).mean() / (st_[:, 1] ** 2).mean())
     ok_pan = lr > 3
     print(f"   панорама: довгота 150°W -> ліво/право гучність x{lr:.1f}  {'OK' if ok_pan else 'FAIL'}")
     ok_all &= ok_pitch and ok_pulse and ok_pan
 
-    # демо-подорож: Антарктичні води -> екватор Тихого океану -> Атлантика -> Середземне -> Чорне море
-    route = [(-62, -150), (-30, -140), (0, -140), (15, -60), (40, -40), (55, -20), (36, 10), (43, 34)]
-    seconds, blk = 16.0, 512
-    son = Sonifier(enabled=False)
-    out_chunks, nblk = [], int(seconds * sr / blk)
-    seg = np.linspace(0, len(route) - 1, nblk)
-    for k in range(nblk):
-        i = min(int(seg[k]), len(route) - 2); f = seg[k] - i
-        la = route[i][0] + f * (route[i + 1][0] - route[i][0])
-        lo = route[i][1] + f * (route[i + 1][1] - route[i][1])
-        rr = sst.at(la, lo)
-        if rr["t"] is None:
-            son.land(lo)
-        else:
-            son.water(rr["t"], rr["t"] - rr["base"], lo, quiet=rr["land"])
-        if k == nblk - int(1.2 * sr / blk):
-            son.chime()
-        out_chunks.append(son.render(blk))
-    wav = np.concatenate(out_chunks)
-    ok_clip = np.abs(wav).max() < 0.99
-    print(f"   демо-подорож {seconds:.0f} с, пік амплітуди {np.abs(wav).max():.2f} (без перевантаження: "
-          f"{'OK' if ok_clip else 'FAIL'})")
-    ok_all &= ok_clip
+    def render_route(layer, points, seconds, blk=512):
+        """points: [(lat, lon, year)]; лінійно між ними. -> стерео-масив"""
+        son_ = Sonifier(enabled=False)
+        nblk = int(seconds * sr / blk)
+        seg = np.linspace(0, len(points) - 1, nblk)
+        chunks = []
+        for k in range(nblk):
+            i = min(int(seg[k]), len(points) - 2); f = seg[k] - i
+            la, lo, yr = [points[i][q] + f * (points[i + 1][q] - points[i][q]) for q in range(3)]
+            r_ = layer.sample(la, lo, int(round(yr)) if layer.years is not None else None)
+            if r_["missing"]:
+                son_.missing(lo)
+            else:
+                son_.play(r_["norm"], r_["tension"], lo, quiet=bool(r_["near_km"]))
+            if k == nblk - int(1.2 * sr / blk):
+                son_.chime()
+            chunks.append(son_.render(blk))
+        return np.concatenate(chunks)
 
-    print("\n6) Рендер панелі та карти температури:")
-    view, panel = SSTMapView(sst), Panel(330, sst)
-    trail = [(43.5 + k * 0.3, 20 + k) for k in range(15)]
-    r = sst.at(46.48, 30.73)
-    img_map = view.render(46.48, 30.73, trail, 0.6, r["t"])
-    img_panel = panel.render(540, {"state": "ok", "lat": 46.48, "lon": 30.73, "r": r, "sheet": "tracked",
-                                   "dwell": 0.6, "last_fix": report(43.5, 34.0, sst)})
-    out = Path(args.selftest_out)
-    out.mkdir(parents=True, exist_ok=True)
-    write_wav(out / "sonification_demo.wav", wav)
-    cv2.imwrite(str(out / "selftest_map.png"), img_map)
-    cv2.imwrite(str(out / "selftest_panel.png"), img_panel)
+    demos = []
+    if "sst" in by:   # подорож океаном: Антарктика -> екватор Тихого -> Атлантика -> Середземне -> Чорне море
+        route = [(-62, -150, 0), (-30, -140, 0), (0, -140, 0), (15, -60, 0), (40, -40, 0), (55, -20, 0), (36, 10, 0),
+                 (43, 34, 0)]
+        demos.append(("sonification_demo.wav", "подорож океаном (sst)", render_route(by["sst"], route, 16.0)))
+    if "temperature" in by:   # машина часу: одна точка (Одеса), 1880 -> 2025
+        demos.append(("sonification_odesa_1880_2025.wav", "Одеса 1880→2025 (temperature)",
+                      render_route(by["temperature"], [(46.48, 30.73, 1880), (46.48, 30.73, 2025)], 20.0)))
+    if "co2_curve" in by:
+        demos.append(("sonification_co2_1958_2025.wav", "CO₂ 1958→2025 (co2_curve)",
+                      render_route(by["co2_curve"], [(0, 0, 1958), (0, 0, 2025)], 15.0)))
+    for fname, title, wav in demos:
+        ok = np.abs(wav).max() < 0.99
+        ok_all &= ok
+        write_wav(out / fname, wav)
+        print(f"   {title}: {len(wav) / sr:.0f} с, пік {np.abs(wav).max():.2f} {'OK' if ok else 'FAIL'} -> {fname}")
+
+    print("\n7) Рендер панелі та вікна для кожного шару:")
+    view, panel = L.LayerView(), Panel(340)
+    for k, s in enumerate(specs, 1):
+        lay = by[s.name]
+        y = lay.default_year()
+        smp = lay.sample(46.48, 30.73, y)
+        trail = [(43.5 + q * 0.3, 20 + q) for q in range(15)]
+        cv2.imwrite(str(out / f"selftest_view_{s.name}.png"), view.render(lay, y, (46.48, 30.73), trail, 0.6, smp["text"]))
+        cv2.imwrite(str(out / f"selftest_panel_{s.name}.png"), panel.render(700, {
+            "layer": lay, "layer_idx": k, "n_layers": len(specs), "year": y, "playing": False, "state": "ok",
+            "pos": (46.48, 30.73), "sample": smp, "sheet": "tracked", "inliers": 640, "dwell": 0.6,
+            "note": f"{midi_name(norm_to_midi(smp['norm']))}", "last_fix": report(lay, y, 46.48, 30.73, smp)}))
     cv2.imwrite(str(out / "selftest_sheet.png"), cv2.polylines(hand, [np.int32(tracker.corners)], True, (0, 200, 0), 3))
     print(f"   збережено в {out}/")
     print("\nSELFTEST", "PASSED" if ok_all else "FAILED")
 
 
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", type=int, default=0, help="індекс камери (0 - вбудована)")
     ap.add_argument("--recalibrate", action="store_true", help="пройти калібрування заново")
+    ap.add_argument("--layer", help="шар даних на старті (назва: sst, temperature, co2_curve, ...; див. layers.py list)")
+    ap.add_argument("--year", type=int, help="рік на старті (для шарів з роками)")
+    ap.add_argument("--step", type=float, default=0.3, help="секунд на рік у режимі відтворення (p)")
     ap.add_argument("--dwell", type=float, default=3.0, help="скільки секунд тримати палець для запису в консоль")
     ap.add_argument("--radius", type=float, default=0.02,
                     help="допустиме тремтіння пальця, частка ширини кадру (0.02 = 2%%)")
-    ap.add_argument("--month", help="місяць даних РРРР-ММ (за замовчуванням останній у файлі)")
+    ap.add_argument("--month", help="місяць для шару sst РРРР-ММ (за замовчуванням останній у файлі)")
     ap.add_argument("--projection", default="equirect", choices=PROJECTIONS,
                     help="проєкція, якщо клацнуто лише 4 місця")
     ap.add_argument("--lon0", type=float, default=0.0, help="центральний меридіан карти, якщо 4 місця")
@@ -1297,8 +1301,11 @@ def main():
     if args.selftest:
         selftest(args); return
 
-    print("Завантаження даних температури...")
-    sst = SSTLookup(SST_FILE, args.month)
+    specs = L.discover_layers(args.month)
+    if not specs:
+        raise SystemExit("Не знайдено жодного шару даних (sst.mnmean.nc або data/<шар>/). Див. LAYERS.md")
+    if args.layer and args.layer not in [s.name for s in specs]:
+        raise SystemExit(f"Немає шару '{args.layer}'. Є: {', '.join(s.name for s in specs)}")
 
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -1316,7 +1323,7 @@ def main():
             cal = run_calibration(cap, args, scale)
         else:
             print(f"Калібрування з {CALIB_FILE.name}: проєкція {cal.proj}. (--recalibrate щоб переробити)")
-        run_tracking(cap, cal, sst, args, scale)
+        run_tracking(cap, cal, specs, args, scale)
     finally:
         cap.release()
         cv2.destroyAllWindows()
