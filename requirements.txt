@@ -1,0 +1,7 @@
+numpy
+matplotlib
+xarray
+h5netcdf
+h5py
+mediapipe
+opencv-python

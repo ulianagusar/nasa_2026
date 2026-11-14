@@ -1,0 +1,36 @@
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# --- macOS / редактори ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- локальні налаштування Claude Code ---
+.claude/settings.local.json
+
+# --- калібрування камери: залежить від того, де стоїть камера і лежить карта ---
+calibration.json
+
+# --- великі дані, завантажуються окремо (див. команди нижче) ---
+# NOAA ERSST v5, ~160 МБ (GitHub не приймає файли > 100 МБ):
+#   curl -L -o sst.mnmean.nc https://downloads.psl.noaa.gov/Datasets/noaa.ersst.v5/sst.mnmean.nc
+*.nc
+*.nc.gz
+
+# Модель MediaPipe для трекінгу руки, ~7.5 МБ:
+#   mkdir -p models && curl -L -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+models/
+
+# Контури суші Natural Earth, ~1.6 МБ:
+#   mkdir -p data && curl -L -o data/ne_50m_land.geojson https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson
+data/
+
+# --- відео/аудіо/кадри, які згенеруємо пізніше ---
+frames/
+*.mp4
+*.mov
+*.wav
