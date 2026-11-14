@@ -45,23 +45,26 @@ BUILTIN = {
         "title": "Аномалія температури (суша + океан)",
         "fmt": "{:+.2f}", "default_year": 2025, "tension_scale": 2.0,
         "note": "відносно норми 1951–1980",
+        "speech_note": "Це відхилення від середньої температури 1951–1980.",
     },
     "ocean_sst_video": {
         "title": "Температура океану з відео NASA (ECCO2)",
         "fmt": "{:.1f}", "cmap": "sequential", "default_frame": 0,
         "baseline": "mean", "base_label": "середнє за рік у цій точці", "tension_scale": 4.0,
         "missing_label": "суша / немає кольору", "note": "оцінка за кольором відео; дати кадрів приблизні",
+        "speech_note": "Температуру оцінено за кольором відео NASA.",
     },
     "ocean_flow_activity": {
         "title": "Активність течій з відео NASA (0–1)",
         "units": "", "fmt": "{:.2f}", "cmap": "blues", "default_frame": 0,
         "missing_label": "суша / немає ліній",
         "note": "візуальний показник густоти ліній, не швидкість; дати кадрів приблизні",
+        "speech_note": "Це густота ліній течій на відео, від нуля до одного.",
     },
 }
 CFG_KEYS = ("title", "units", "source", "description", "note", "fmt", "vmin", "vmax", "cmap", "baseline",
             "base_label", "tension_scale", "default_year", "default_frame", "missing_label", "static_label",
-            "partial_years", "prefer")
+            "partial_years", "prefer", "speech_note", "max_near_km")
 
 
 def wrap180(lon):
@@ -256,6 +259,8 @@ class GridLayer(Layer):
         self.baseline_grid = baseline_grid
         self.clipped = clipped
         self.search_cells = search_cells
+        # далі цієї відстані "найближче значення" вже вводить в оману (напр. океан посеред Ефіопії)
+        self.max_near_km = float(cfg.get("max_near_km", 300))
 
     def grid(self, t):
         return self.data[self.clamp_frame(t)]
@@ -279,7 +284,7 @@ class GridLayer(Layer):
                         d = float(haversine_km(lat, lon, self.lat[ii], self.lon[jj]))
                         if best is None or d < best[0]:
                             best = (d, ii, jj)
-            if best is None:
+            if best is None or best[0] > self.max_near_km:
                 return self._missing()
             near, i, j = best
         base = self.baseline_grid[i, j] if self.baseline_grid is not None else self.baseline

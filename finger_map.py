@@ -4,6 +4,8 @@
 Дві руки: ПРАВИЙ вказівний палець водить по карті, ЛІВИЙ вказівний палець задає рік -
 його положення вздовж карти (лівий край аркуша = перший рік, правий = останній).
 Шари: клавіші l / 1-9; рік також , . (±1), < > (±10), p (відтворення); h - поміняти руки.
+Фіксація (правий палець 3 с на місці) -> голос (Lesya) озвучує місце (країна / море / регіон),
+час і значення шару (speech.py); v - вимкнути голос, r - повторити.
 
 Камера дивиться на роздруковану карту світу. Програма:
   * відстежує карту за її власним малюнком (ORB-точки + гомографія), без фізичних
@@ -29,6 +31,7 @@
 """
 import argparse
 import json
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -38,6 +41,7 @@ import cv2
 import numpy as np
 
 import layers as L
+import speech as SP
 
 HERE = Path(__file__).resolve().parent
 CALIB_FILE = HERE / "calibration.json"
@@ -46,6 +50,25 @@ TEMPLATE_FILE = HERE / "calibration_template.png"
 MODEL_FILE = HERE / "models" / "hand_landmarker.task"
 INDEX_TIP = 8  # MediaPipe: кінчик вказівного пальця
 WIN_CAM, WIN_SST = "Earth Map", "Data Layer"
+
+# Клавіші у вікні: (як показати, як вимовити, що робить). З цього одного списку будуються
+# і довідка в консолі, і голосова довідка (клавіша ?), тож вони не розходяться.
+KEYS = [
+    ("?", "знак питання", "ця довідка; натисніть ще раз, щоб зупинити"),
+    ("i", "латинська і", "перелік карт"),
+    ("1-9", "цифри від 1 до {n}", "вибрати карту за номером"),
+    ("l", "клавіша ел", "наступна карта"),
+    (", .", "кома і крапка", "крок у часі назад і вперед"),
+    ("< >", "шифт з комою і шифт з крапкою", "десять кроків у часі"),
+    ("p", "клавіша пе", "автоматичне програвання часу, ще раз пауза"),
+    ("r", "клавіша ер", "повторити останнє повідомлення"),
+    ("m", "клавіша ем", "вимкнути або увімкнути звук"),
+    ("v", "клавіша ве", "вимкнути або увімкнути голос"),
+    ("h", "клавіша аш", "поміняти ролі рук, якщо програма їх плутає"),
+    ("c", "клавіша це", "калібрування карти заново"),
+    ("k", "клавіша ка", "заново позначити кути карти"),
+    ("q", "клавіша кю", "вихід"),
+]
 
 # Впізнавані точки для калібрування: (назва для вікна, назва для консолі, lat, lon)
 LANDMARKS = [
@@ -665,7 +688,10 @@ class Panel:
             st += f" ({info['inliers']} точок)"
         d.text((x, y), f"Карта: {st}", font=self.f["xs"], fill=col("ink2")); y += 18
         snd = "вимкнено (m)" if info.get("muted") else (f"нота {info['note']}" if info.get("note") else "тиша")
-        d.text((x, y), f"Звук: {snd}", font=self.f["xs"], fill=col("ink2")); y += 24
+        d.text((x, y), f"Звук: {snd}", font=self.f["xs"], fill=col("ink2")); y += 18
+        vo = info.get("voice")
+        d.text((x, y), "Голос: " + ("говорить…" if info.get("speaking") else vo or "вимкнено (v)") +
+               ("   r повторити" if vo else ""), font=self.f["xs"], fill=col("ink2")); y += 24
         frac = info.get("dwell", 0.0)
         d.text((x, y), "Фіксація в консоль (3 с)", font=self.f["xs"], fill=col("ink2")); y += 18
         d.rectangle([x, y, self.w - 20, y + 8], fill=L.hex_rgb(GRIDC))
@@ -675,7 +701,8 @@ class Panel:
         if info.get("last_fix"):
             d.text((x, y), "Остання фіксація:", font=self.f["xs"], fill=col("muted")); y += 18
             self._text(d, x, y, info["last_fix"], self.f["xs"], "ink", W, 17, max_lines=4)
-        d.text((x, height - 24), "q вихід · c калібр. · k кути · m звук · h руки", font=self.f["xs"], fill=col("muted"))
+        d.text((x, height - 42), "? довідка · i карти · r повтор · v голос", font=self.f["xs"], fill=col("muted"))
+        d.text((x, height - 24), "q вихід · m звук · h руки · c/k калібр.", font=self.f["xs"], fill=col("muted"))
         return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
 
 
@@ -712,11 +739,11 @@ class Sonifier:
     SR = 44100
     N_H = 6
     TAU = {"freq": 0.06, "amp": 0.08, "noise": 0.15, "detune": 0.3, "bright": 0.3,
-           "prate": 0.4, "pdepth": 0.3, "pan": 0.15}
+           "prate": 0.4, "pdepth": 0.3, "pan": 0.15, "duck": 0.12}
 
     def __init__(self, enabled=True, volume=0.8):
         self.target = {"freq": 220.0, "amp": 0.0, "noise": 0.0, "detune": 0.0, "bright": 1.8,
-                       "prate": 1.0, "pdepth": 0.0, "pan": 0.0}
+                       "prate": 1.0, "pdepth": 0.0, "pan": 0.0, "duck": 1.0}
         self.cur = dict(self.target)
         self.ph1 = np.zeros(self.N_H); self.ph2 = np.zeros(self.N_H); self.pph = 0.0
         self.chime_f, self.chime_t = None, 0.0
@@ -760,6 +787,10 @@ class Sonifier:
     def chime(self):
         self.chime_f, self.chime_t = 2 * self.target["freq"], 0.0
 
+    def set_duck(self, on):
+        """Притишити синтезатор (напр. поки звучить голос), щоб було чути слова."""
+        self.target["duck"] = 0.2 if on else 1.0
+
     def toggle_mute(self):
         self.muted = not self.muted
         return self.muted
@@ -780,6 +811,7 @@ class Sonifier:
         f, amp, noise = self._ramp("freq", n), self._ramp("amp", n), self._ramp("noise", n)
         det, bright = self._ramp("detune", n), self._ramp("bright", n)
         prate, pdepth, pan = self._ramp("prate", n), self._ramp("pdepth", n), self._ramp("pan", n)
+        duck = self._ramp("duck", n)
         h = np.arange(1, self.N_H + 1)[:, None]
         w = h ** (-bright[None, :])                                   # спад гармонік
         w /= w.sum(0, keepdims=True)
@@ -801,7 +833,7 @@ class Sonifier:
             self.chime_t = t[-1] + 1 / self.SR
             if self.chime_t > 2.0:
                 self.chime_f = None
-        sig = np.tanh(1.2 * sig) / 1.2 * self.volume
+        sig = np.tanh(1.2 * sig) / 1.2 * self.volume * duck
         theta = (pan + 1) * np.pi / 4                                 # рівнопотужна панорама
         return np.stack([sig * np.cos(theta), sig * np.sin(theta)], 1).astype(np.float32)
 
@@ -896,6 +928,11 @@ def run_tracking(cap, cal, specs, args, scale):
     tracker = make_tracker(args.track, cal, frame.shape)
     finger, time_finger = OneEuro(), OneEuro(min_cutoff=0.8)
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
+    geo = SP.Geocoder()                                         # країни / моря / регіони з українськими назвами
+    voice = SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate)
+    last_spoken = ""
+    if voice.enabled:
+        print(f"Голос: {voice.voice}. Після фіксації озвучується місце, час і значення (v - вимкнути, r - повторити).")
     panel, view = Panel(340), L.LayerView()
     names = [s.name for s in specs]
     li = names.index(args.layer) if args.layer in names else 0
@@ -909,8 +946,9 @@ def run_tracking(cap, cal, specs, args, scale):
         print(f"   {k}. {s.title}" + ("   <- зараз" if k - 1 == li else ""))
     print("   ПРАВА рука, вказівний палець: водити по карті.")
     print("   ЛІВА рука, вказівний палець: час - вести вздовж карти (лівий край = перший кадр, правий = останній).")
-    print("   Клавіші у вікні: l / 1-9 - шар, , . - кадр ±1, < > - ±10, p - відтворення,")
-    print("   h - поміняти руки, m - звук, q - вихід, c - калібрування, k - кути.")
+    print("   Клавіші у вікні:")
+    for disp, _, what in KEYS:
+        print(f"   {disp:>5s}  {what.replace('{n}', str(min(len(specs), 9)))}")
     print(f"   Правий палець {args.dwell:.0f} с на місці -> запис сюди.")
     if son.stream is not None:
         print("   Звук: висота = значення шару (пентатоніка), биття і пульсація = наскільки вище базового")
@@ -933,6 +971,25 @@ def run_tracking(cap, cal, specs, args, scale):
         layer = specs[li].load()
         t = layer.frame_at(when)
         trail.clear()
+        intro = SP.layer_intro(li + 1, len(specs), layer)
+        print(f"   🔊 {intro}")
+        voice.speak(intro)
+
+    def announce(text):
+        nonlocal last_spoken
+        if voice.speaking() and last_spoken == text:            # повторне натискання під час мовлення = стоп
+            voice.stop()
+            print("🔇 зупинено")
+            return
+        last_spoken = text
+        print(f"🔊 {text}")
+        voice.speak(text)
+        if not voice.enabled:
+            print("   (голос вимкнено: v - увімкнути)")
+
+    if voice.enabled:
+        voice.speak(f"Earth Jukebox готовий. Обрано карту {li + 1} з {len(specs)}: {SP.spoken_title(layer)}. "
+                    "Натисніть знак питання, щоб почути довідку, або латинську і, щоб почути перелік карт.")
 
     while True:
         frame = _read(cap)
@@ -982,7 +1039,8 @@ def run_tracking(cap, cal, specs, args, scale):
 
         info = {"state": "nohand", "sheet": tracker.status, "dwell": 0.0, "last_fix": last_fix,
                 "inliers": getattr(tracker, "inliers", None), "layer": layer, "layer_idx": li + 1,
-                "n_layers": len(specs), "t": t, "playing": playing, "time_hand": time_hand}
+                "n_layers": len(specs), "t": t, "playing": playing, "time_hand": time_hand,
+                "voice": voice.voice if voice.enabled else None, "speaking": voice.speaking()}
         lat = lon = None
         frac = 0.0
         if smooth is not None:
@@ -1012,10 +1070,15 @@ def run_tracking(cap, cal, specs, args, scale):
             fired = True
             if s is not None:
                 last_fix = report(layer, t, lat, lon, s)
+                last_spoken = SP.compose(layer, t, lat, lon, s, geo.locate(lat, lon) if geo.ready else None)
                 print(last_fix)
+                print(f"   🔊 {last_spoken}")
                 son.chime()
+                voice.speak(last_spoken)
             else:
                 print(f"[{datetime.now():%H:%M:%S}] палець поза картою")
+                voice.speak("Палець поза картою.")
+        son.set_duck(voice.speaking())
 
         # ---- звук ----
         if s is None:
@@ -1054,6 +1117,22 @@ def run_tracking(cap, cal, specs, args, scale):
             break
         if key == ord("m"):
             print("Звук вимкнено" if son.toggle_mute() else "Звук увімкнено")
+        if key == ord("v"):
+            if voice.enabled:
+                voice.stop()
+                voice.enabled = False
+                print("Голос вимкнено")
+            elif not args.no_voice or voice.voice:
+                voice = SP.Speaker(enabled=True, voice=args.voice, rate=args.voice_rate)
+                print("Голос увімкнено" if voice.enabled else "Голос недоступний")
+        if key == ord("r") and last_spoken and voice.enabled:
+            voice.speak(last_spoken)
+        if key == ord("i"):
+            son.silence()
+            announce(SP.layers_announcement(specs, li + 1))
+        if key in (ord("?"), ord("/")):
+            son.silence()
+            announce(SP.help_announcement(KEYS, len(specs)))
         if key == ord("h"):
             swap = not swap
             print("Руки поміняно місцями: тепер " + ("ліва водить по карті, права керує часом" if swap
@@ -1085,6 +1164,7 @@ def run_tracking(cap, cal, specs, args, scale):
             cal.save(CALIB_FILE)
             tracker = make_tracker(args.track, cal, frame.shape)
             tracker.locked = True
+    voice.stop()
     son.close()
     landmarker.close()
 
@@ -1331,6 +1411,68 @@ def selftest(args):
         print(f"   автопошук бачить новий шар: {found} {'OK' if ok else 'FAIL'}")
 
     # ---- звук ----
+    print("\n5b) Озвучення точки (географія + текст + голос):")
+    geo = SP.Geocoder()
+    expect = [((9.0, 39.5), "Ефіопія"), ((50.45, 30.52), "Україна"), ((45.8, 31.0), "Чорне море"),
+              ((-28.0, 30.5), "Південно-Африканська Республіка"), ((0.0, -140.0), "Тихий океан"),
+              ((28.0, 85.0), "Гімалаї")]
+    ok_g = True
+    for (la, lo), want in expect:
+        ph = SP.place_phrase(geo.locate(la, lo))
+        good = want in ph
+        ok_g &= good
+        print(f"   {la:+6.1f},{lo:+7.1f} -> {ph}  {'OK' if good else 'FAIL'}")
+    plur = [SP.spoken_quantity(v, "°C", 1) for v in (1.0, 2.0, 5.0, 21.0, 22.4)]
+    ok_p = plur == ["1 градус", "2 градуси", "5 градусів", "21 градус", "22,4 градуса"]
+    print(f"   відмінки: {plur} {'OK' if ok_p else 'FAIL'}")
+    msgs = []
+    if "temperature" in by:
+        te = by["temperature"]; k_ = te.frame_at(2025.5)
+        msgs.append(SP.compose(te, k_, 9.0, 39.5, te.sample(9.0, 39.5, k_), geo.locate(9.0, 39.5)))
+    if "sst" in by:
+        msgs.append(SP.compose(by["sst"], 0, 45.8, 31.0, by["sst"].sample(45.8, 31.0), geo.locate(45.8, 31.0)))
+    if "ocean_sst_video" in by:   # океанський шар посеред суходолу: чесно "даних немає", а не океан за 600 км
+        ov = by["ocean_sst_video"]
+        m_ = SP.compose(ov, 0, 9.0, 39.5, ov.sample(9.0, 39.5, 0), geo.locate(9.0, 39.5))
+        ok_g &= "даних у цій точці немає" in m_
+        msgs.append(m_)
+    for m_ in msgs:
+        print(f"   🔊 {m_}")
+    ann = SP.layers_announcement(specs, 1)
+    hlp = SP.help_announcement(KEYS, len(specs))
+    intro = SP.layer_intro(2, len(specs), by[specs[1].name]) if len(specs) > 1 else ""
+    ok_a = f"Доступно {len(specs)}" in ann and all(SP.spoken_title(by[s.name]) in ann for s in specs)
+    nn = str(min(len(specs), 9))
+    ok_k = all(sp_.replace("{n}", nn).lower() in hlp.lower() for _, sp_, _ in KEYS) and "{n}" not in hlp
+    print(f"   🔊 клавіша i, перелік карт: {ann}  {'OK' if ok_a else 'FAIL'}")
+    print(f"   🔊 перемикання карти: {intro}")
+    print(f"   🔊 клавіша ?, довідка ({len(hlp)} символів, названо всі {len(KEYS)} клавіш {'OK' if ok_k else 'FAIL'}):")
+    print("      " + hlp)
+    ok_g &= ok_a and ok_k
+    sp = SP.Speaker(enabled=True)
+    if sp.enabled:
+        import subprocess
+        for fname, txt in (("layers_announcement.aiff", ann), ("help_announcement.aiff", hlp)):
+            if sp.to_file(txt, out / fname):
+                info_ = subprocess.run(["afinfo", str(out / fname)], capture_output=True, text=True).stdout
+                dur = re.search(r"estimated duration: ([\d.]+)", info_)
+                print(f"   записано {fname}: {float(dur.group(1)) if dur else 0:.0f} с звучання")
+    if sp.enabled and msgs:
+        aiff = out / "speech_test.aiff"
+        ok_v = sp.to_file(msgs[0], aiff) and aiff.stat().st_size > 10000
+        print(f"   голос {sp.voice}: записано {aiff.name} ({aiff.stat().st_size // 1024} КБ) {'OK' if ok_v else 'FAIL'}")
+        ok_g &= ok_v
+    else:
+        print("   голос недоступний на цій машині (тест запису пропущено)")
+    s_ = Sonifier(enabled=False)
+    s_.play(0.5, 0.0, 0.0); s_.render(Sonifier.SR // 2)
+    loud = np.abs(s_.render(Sonifier.SR // 4)).max()
+    s_.set_duck(True); s_.render(Sonifier.SR // 2)
+    quiet = np.abs(s_.render(Sonifier.SR // 4)).max()
+    ok_d = quiet < 0.3 * loud
+    print(f"   приглушення синтезатора під час голосу: {loud:.2f} -> {quiet:.2f} {'OK' if ok_d else 'FAIL'}")
+    ok_all &= ok_g and ok_p and ok_d
+
     print("\n6) Сонифікація (синтез без звукової карти):")
     sr = Sonifier.SR
     base_layer = by.get("sst") or next(iter(by.values()))
@@ -1438,6 +1580,9 @@ def main():
                     help="як відстежувати карту: features - за малюнком карти (за замовчуванням), "
                          "contour - за краями аркуша, static - карта нерухома")
     ap.add_argument("--no-sound", action="store_true", help="без сонифікації")
+    ap.add_argument("--no-voice", action="store_true", help="не озвучувати точку голосом після фіксації")
+    ap.add_argument("--voice", default="Lesya", help="голос macOS для озвучення (за замовчуванням Lesya, українська)")
+    ap.add_argument("--voice-rate", type=int, default=185, help="швидкість мовлення, слів за хвилину")
     ap.add_argument("--volume", type=float, default=0.8, help="гучність 0..1")
     ap.add_argument("--width", type=int, default=1280, help="ширина кадру камери")
     ap.add_argument("--view", type=int, default=860, help="ширина відображення камери у вікні, px")
