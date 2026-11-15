@@ -1,130 +1,134 @@
-# Шари даних Earth Jukebox
+# Earth Jukebox data layers
 
-`finger_map.py` не знає нічого про конкретні дані. Усе, що він показує й озвучує, бере з **шарів**
-([layers.py](layers.py)). Шар — це завжди **карта**: значення залежить від місця, куди вказує правий
-палець. Шари знаходяться автоматично під час запуску; перемикаються клавішами `l` або `1`–`9`
-у вікні програми. Рік для шарів з роками задає лівий палець (його положення вздовж карти).
+`finger_map.py` knows nothing about specific data. Everything it shows and speaks comes from **layers**
+([layers.py](layers.py)). A layer is always a **map**: the value depends on the place the right finger
+points at. Layers are discovered automatically at start-up and switched with the `l` or `1`–`9` keys
+in the program window. For layers with several time frames, the left finger sets the time (its
+position along the map); on the globe surfaces the time is set with the keys.
 
 ```bash
-.venv/bin/python layers.py list          # які шари бачить програма
+.venv/bin/python layers.py list          # which layers the program sees
 .venv/bin/python finger_map.py --layer temperature --year 1990
 ```
 
-## Які шари є зараз
+## Layers available now
 
-| Назва | Тип | Що | Звідки |
+| Name | Type | What | Source |
 |---|---|---|---|
-| `sst` | карта, 1 момент | Температура поверхні океану, останній місяць + норма 1971–2000 | `sst.mnmean.nc` (NOAA ERSST v5) |
-| `temperature` | 147 кадрів, роки 1880–2026 | Аномалія температури суші й океану відносно 1951–1980 | `data/temperature/` (NASA GISTEMP v4) |
-| `ocean_sst_video` | 48 кадрів, тижні 03.2007–02.2008 | Температура океану, розшифрована з кольору відео (модель ECCO2). «Норма» = середнє за рік у кожній клітинці | `data/ocean_sst_video/` (NASA SVS 3912) |
-| `ocean_flow_activity` | 48 кадрів, тижні 03.2007–02.2008 | Частка намальованих ліній течій у клітинці (0–1) — візуальний показник, не швидкість | `data/ocean_flow_activity/` (NASA SVS 3912) |
+| `sst` | map, 1 moment | Sea surface temperature, the latest month + the 1971–2000 normal | `sst.mnmean.nc` (NOAA ERSST v5) |
+| `temperature` | 147 frames, years 1880–2026 | Land and ocean temperature anomaly vs 1951–1980 | `data/temperature/` (NASA GISTEMP v4) |
+| `ocean_sst_video` | 48 frames, weeks 03.2007–02.2008 | Ocean temperature decoded from the colours of a video (ECCO2 model). The "normal" is the yearly mean of each cell | `data/ocean_sst_video/` (NASA SVS 3912) |
+| `ocean_flow_activity` | 48 frames, weeks 03.2007–02.2008 | Share of drawn current lines in a cell (0–1) - a visual index, not a speed | `data/ocean_flow_activity/` (NASA SVS 3912) |
 
-Час у шарі — це послідовність **кадрів**: роки (`temperature`) або дати (`ocean_*`). Лівий палець
-проходить усі кадри від лівого до правого краю карти. Під час перемикання шару програма бере
-найближчий кадр до того самого моменту часу.
+Time in a layer is a sequence of **frames**: years (`temperature`) or dates (`ocean_*`). The left finger
+goes through all frames from the left to the right edge of the map. When the layer is switched, the
+program picks the frame closest to the same moment in time.
 
-Папки в `data/` без `*.meta.json` (наприклад, крива `data/co2_curve/` — одне число на рік для всієї
-планети) програма пропускає: на карті їх немає куди «показати пальцем».
+Folders in `data/` without `*.meta.json` (for example the curve `data/co2_curve/` - one number per year for
+the whole planet) are skipped: there is nothing on the map to point at.
 
-## Як додати новий шар
+## How to add a new layer
 
-Є три способи — від найпростішого.
+There are three ways, from the simplest.
 
-### 1. У мене є NetCDF (`.nc`) з полем `(time, lat, lon)`
+### 1. I have a NetCDF file (`.nc`) with a `(time, lat, lon)` variable
 
 ```bash
-.venv/bin/python layers.py from-netcdf шлях/до/файлу.nc --var назва_змінної --name мій_шар \
-    --title "Опади" --units "мм/добу" --source "NASA GPM"
+.venv/bin/python layers.py from-netcdf path/to/file.nc --var variable_name --name my_layer \
+    --title "Precipitation" --units "mm/day" --source "NASA GPM"
 ```
 
-Конвертер усереднює час по роках, перевертає широти з півдня на північ, переводить довготи
-в −180…180 і записує папку `data/мій_шар/`. Після цього шар одразу з'являється в програмі.
-Для аномалій (значення навколо нуля) додайте `--diverging` — тоді шкала буде симетричною
-(синій–сірий–червоний). Якщо роки усереднювати не треба: `--monthly`.
+The converter averages time by year, flips latitudes to run south to north, converts longitudes
+to −180…180 and writes the folder `data/my_layer/`. The layer then appears in the program right away.
+For anomalies (values around zero) add `--diverging` to get a symmetric scale
+(blue–grey–red). If the years should not be averaged: `--monthly`.
 
-### 2. У мене вже є масив у Python
+### 2. I already have an array in Python
 
 ```python
 import layers as L
-L.write_layer("data", "ndvi", years, lat, lon, data,      # data: [рік][широта][довгота], NaN = немає даних
-              units="", title="Зелень рослинності (NDVI)", source="NASA MODIS")
+L.write_layer("data", "ndvi", years, lat, lon, data,      # data: [year][lat][lon], NaN = no data
+              units="", title="Vegetation greenness (NDVI)", source="NASA MODIS")
 ```
 
-### 3. Формат вручну (так зроблено `temperature`)
+### 3. Writing the format by hand (this is how `temperature` is made)
 
-Папка `data/<назва>/` з двома файлами:
+A folder `data/<name>/` with two files:
 
-- `<назва>.meta.json` — `{"years": [...], "lat": [...], "lon": [...], "vmin": .., "vmax": .., "units": "..", "description": "..", "source": ".."}`.
-  Для карти без років — `"years": null`. Якщо кадри частіші за рік (тижні, місяці), додайте
-  `"dates": ["2007-03-28", ...]` — по даті на кадр; тоді `years` — лише рік кожного кадру.
-- `<назва>.u8.bin` — масив `uint8` форми `[роки][lat][lon]`: `0..254` = значення від `vmin` до `vmax`,
-  `255` = немає даних. (Замість нього можна покласти `<назва>.json` з полем `data` і `null` для пропусків.)
-- Якщо є обидва файли, програма бере **`.json`, коли він менший за 20 МБ** (точніший: без квантування
-  і без обрізання за `vmin`/`vmax`), інакше `.u8.bin`. Перевизначити: `"prefer": "u8"` або `"json"` у `jukebox.json`.
+- `<name>.meta.json` - `{"years": [...], "lat": [...], "lon": [...], "vmin": .., "vmax": .., "units": "..", "description": "..", "source": ".."}`.
+  For a map without years - `"years": null`. If the frames are more frequent than yearly (weeks, months), add
+  `"dates": ["2007-03-28", ...]` - one date per frame; `years` is then just the year of each frame.
+- `<name>.u8.bin` - a `uint8` array of shape `[years][lat][lon]`: `0..254` = values from `vmin` to `vmax`,
+  `255` = no data. (Instead you can provide `<name>.json` with a `data` field and `null` for gaps.)
+- If both files exist, the program uses **the `.json` when it is smaller than 20 MB** (more accurate: no
+  quantization and no clipping at `vmin`/`vmax`), otherwise the `.u8.bin`. Override with `"prefer": "u8"` or `"json"` in `jukebox.json`.
 
-Порядок широт і довгот не важливий — програма сама відсортує.
+The order of latitudes and longitudes does not matter - the program sorts them.
 
-## Налаштування шару: `data/<назва>/jukebox.json` (необов'язково)
+## Layer settings: `data/<name>/jukebox.json` (optional)
 
-Перекриває будь-які значення з метаданих. Усі ключі необов'язкові:
+Overrides any value from the metadata. All keys are optional:
 
 ```json
 {
-  "title": "Опади",
-  "units": "мм/добу",
+  "title": "Precipitation",
+  "units": "mm/day",
   "fmt": "{:.1f}",
   "cmap": "blues",
   "vmin": 0, "vmax": 12,
   "baseline": 3.0,
-  "base_label": "середнє 1981–2010",
+  "base_label": "the 1981–2010 average",
   "tension_scale": 2.0,
   "default_year": 2025,
-  "missing_label": "немає вимірювань",
-  "note": "середнє за рік"
+  "missing_label": "no measurements",
+  "note": "yearly mean",
+  "speech_note": "This is the yearly mean."
 }
 ```
 
-| Ключ | Що робить |
+| Key | What it does |
 |---|---|
-| `title`, `units`, `source`, `note` | Тексти в панелі й заголовку карти |
-| `fmt` | Формат числа (`"{:+.2f}"` — зі знаком, для аномалій) |
-| `cmap` | `diverging`, `sequential`, `blues`, `greens` або список hex-кольорів `["#fff", "#000"]` |
-| `vmin`, `vmax` | Межі шкали кольору **і висоти ноти** (vmin → C3, vmax → E5) |
-| `baseline` | Базовий рівень («норма»): число або `"mean"` — середнє за всі кадри в кожній клітинці окремо. Від нього рахується «напруга» звуку |
-| `base_label` | Як назвати базовий рівень у панелі |
-| `tension_scale` | Скільки одиниць вище базового рівня = максимальна тривога у звуці |
-| `default_year` | З якого року починати (наприклад, останній повний) |
-| `default_frame` | З якого кадру починати (номер від 0) — для шарів з датами |
-| `prefer` | `"json"` або `"u8"` — з якого файлу читати дані |
-| `speech_note` | Речення, яке голос додає після значення (напр. «Це відхилення від норми 1951–1980.») |
-| `max_near_km` | Якщо в точці немає даних, брати найближчу клітинку лише в межах цієї відстані (за замовчуванням 300 км) |
+| `title`, `units`, `source`, `note` | Texts in the panel and the map title |
+| `fmt` | Number format (`"{:+.2f}"` - with a sign, for anomalies) |
+| `cmap` | `diverging`, `sequential`, `blues`, `greens` or a list of hex colours `["#fff", "#000"]` |
+| `vmin`, `vmax` | Limits of the colour scale **and of the note pitch** (vmin → C3, vmax → E5) |
+| `baseline` | The baseline ("normal"): a number or `"mean"` - the mean over all frames in each cell separately. The "tension" of the sound is measured from it |
+| `base_label` | How the baseline is named in the panel and by the voice, e.g. `"the 1971–2000 normal"` |
+| `tension_scale` | How many units above the baseline = maximum alarm in the sound |
+| `default_year` | Which year to start from (e.g. the last complete one) |
+| `default_frame` | Which frame to start from (index from 0) - for dated layers |
+| `partial_years` | Years with incomplete data, e.g. `[2026]` - the panel shows "(partial year)" |
+| `prefer` | `"json"` or `"u8"` - which file to read the data from |
+| `speech_note` | A sentence the voice adds after the value (e.g. "This is the difference from the 1951–1980 average.") |
+| `max_near_km` | If a point has no data, use the nearest cell only within this distance (default 300 km) |
 
-## Що каже голос
+## What the voice says
 
-Після фіксації правого пальця (3 с) голос озвучує: **місце** (країна і її частина, регіон світу,
-природний регіон; або море/океан і найближча країна), **час** (рік або дата кадру), **назву шару
-і значення**, порівняння з базовим рівнем і `speech_note`. Назва шару береться з `title` без
-пояснень у дужках. Місце визначається офлайн за контурами Natural Earth з українськими назвами
-(`data/ne_50m_*.geojson`, завантажуються автоматично) — див. [speech.py](speech.py).
-| `partial_years` | Роки з неповними даними, напр. `[2026]` — у панелі буде «(неповний рік)» |
+After the right finger has been still for 3 s, the voice announces: **the place** (country and part of it,
+world region, natural region; or sea/ocean and the nearest country), **the time** (year or frame date),
+**the layer name and value**, the comparison with the baseline and the `speech_note`. The layer name is
+the `title` without the explanation in brackets. The place is found offline from the Natural Earth
+outlines (`data/ne_50m_*.geojson`, downloaded automatically) - see [speech.py](speech.py).
+The voice is the best installed English macOS voice (Premium/Enhanced voices are picked first);
+choose another one with `--voice Daniel`.
 
-## Як шар перетворюється на звук
+## How a layer becomes sound
 
-Для будь-якого шару однаково ([finger_map.py](finger_map.py), `Sonifier.play`):
+The same for every layer ([finger_map.py](finger_map.py), `Sonifier.play`):
 
-| Дані шару | Звук |
+| Layer data | Sound |
 |---|---|
-| значення в шкалі `vmin…vmax` | висота ноти (13 нот пентатоніки C3…E5) і яскравість тембру |
-| `(значення − baseline) / tension_scale` | биття і пульсація-«серцебиття», якщо вище базового рівня |
-| довгота пальця | стерео (захід ліворуч, схід праворуч) |
-| немає даних | тихий шум |
+| value on the `vmin…vmax` scale | note pitch (13 pentatonic notes C3…E5) and timbre brightness |
+| `(value − baseline) / tension_scale` | beating and a pulsing "heartbeat" when above the baseline |
+| finger longitude | stereo (west on the left, east on the right) |
+| no data | soft noise |
 
-Якщо `baseline` не задано і шкала не симетрична навколо нуля, «напруги» немає — звучить лише висота.
+If no `baseline` is set and the scale is not symmetric around zero, there is no "tension" - only the pitch is heard.
 
-## Корисне
+## Useful
 
-- `layers.py list` — перевірити, що новий шар знайшовся і роки правильні.
-- `finger_map.py --selftest` — перевіряє всі шари, конвертер і звук без камери; кладе картинки
-  кожного шару і демо-WAV у `selftest_out/`.
-- Папка `data/` у `.gitignore` (великі файли). Маленький шар можна додати в git окремо:
-  `git add -f data/<назва>`.
+- `layers.py list` - check that a new layer is found and its years are right.
+- `finger_map.py --selftest` - checks all layers, the converter, the globe modes and the sound without a camera;
+  puts a picture of every layer and demo WAV files into `selftest_out/`.
+- The `data/` folder is in `.gitignore` (large files). A small layer can be added to git separately:
+  `git add -f data/<name>`.

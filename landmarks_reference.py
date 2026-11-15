@@ -1,6 +1,6 @@
-"""Довідкове зображення: де саме знаходяться точки калібрування finger_map.py.
+"""Reference image: where exactly the calibration points of finger_map.py are.
 
-Запуск:  .venv/bin/python landmarks_reference.py   ->  landmarks_reference.png
+Run:  .venv/bin/python landmarks_reference.py   ->  landmarks_reference.png
 """
 import json
 
@@ -21,7 +21,7 @@ rings = []
 for f in land["features"]:
     g = f["geometry"]
     polys = [g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]
-    rings += [p[0] for p in polys]  # лише зовнішні контури
+    rings += [p[0] for p in polys]  # outer outlines only
 
 
 def draw_land(ax, lw):
@@ -40,21 +40,21 @@ fig = plt.figure(figsize=(19, 15), layout="constrained")
 COLS = 5
 gs = fig.add_gridspec(3, COLS, height_ratios=[2.1, 1, 1])
 
-# --- світова карта ---
+# --- world map ---
 ax = fig.add_subplot(gs[0, :])
 draw_land(ax, 0.3)
 ax.set_xlim(-180, 180); ax.set_ylim(-90, 90); ax.set_aspect("equal")
 ax.set_xticks(range(-180, 181, 30)); ax.set_yticks(range(-90, 91, 30))
 ax.grid(color="white", lw=0.8)
-ZOOM = 9  # половина ширини фрагмента, градусів
-for n, (_, ua, lat, lon) in enumerate(LANDMARKS, 1):
+ZOOM = 9  # half the width of a close-up, degrees
+for n, (_, name, lat, lon) in enumerate(LANDMARKS, 1):
     ax.add_patch(Rectangle((lon - ZOOM, lat - ZOOM * 0.75), 2 * ZOOM, 1.5 * ZOOM, fill=False, ec=MARK, lw=0.8, ls="--"))
     marker(ax, lat, lon, n, 16)
-ax.set_title(f"Точки калібрування: клацайте ЦІ місця на зображенні з камери (по порядку 1 -> {len(LANDMARKS)})",
+ax.set_title(f"Calibration points: click THESE places in the camera picture (in order 1 -> {len(LANDMARKS)})",
              fontsize=14, fontweight="bold", loc="left")
 
-# --- збільшені фрагменти ---
-for n, (_, ua, lat, lon) in enumerate(LANDMARKS, 1):
+# --- close-ups ---
+for n, (_, name, lat, lon) in enumerate(LANDMARKS, 1):
     a = fig.add_subplot(gs[1 + (n - 1) // COLS, (n - 1) % COLS])
     draw_land(a, 0.7)
     a.set_xlim(lon - ZOOM, lon + ZOOM); a.set_ylim(lat - ZOOM * 0.75, lat + ZOOM * 0.75)
@@ -64,7 +64,7 @@ for n, (_, ua, lat, lon) in enumerate(LANDMARKS, 1):
     a.axhline(lat, color=MARK, lw=0.6, ls=":"); a.axvline(lon, color=MARK, lw=0.6, ls=":")
     marker(a, lat, lon, n, 18)
     ns, ew = ("N" if lat >= 0 else "S"), ("E" if lon >= 0 else "W")
-    a.set_title(f"{n}. {ua}", fontsize=11, fontweight="bold", loc="left")
+    a.set_title(f"{n}. " + name.replace(" (", "\n("), fontsize=11, fontweight="bold", loc="left")
     a.text(0.02, 0.03, f"{abs(lat):.2f}°{ns}, {abs(lon):.2f}°{ew}", transform=a.transAxes,
            fontsize=9, color=INK2, bbox=dict(fc="white", ec="none", alpha=0.8, pad=2))
 

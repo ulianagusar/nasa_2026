@@ -1,6 +1,6 @@
-"""Огляд шарів Earth Jukebox: data/temperature (GISTEMP) і data/co2_curve (Mauna Loa).
+"""Overview of the Earth Jukebox layers: data/temperature (GISTEMP) and data/co2_curve (Mauna Loa).
 
-Запуск:  .venv/bin/python explore_jukebox_data.py   ->  jukebox_data_overview.png
+Run:  .venv/bin/python explore_jukebox_data.py   ->  jukebox_data_overview.png
 """
 import json
 
@@ -27,7 +27,7 @@ def load_temperature(path="data/temperature/temperature.json"):
 years, lat, lon, A, meta = load_temperature()
 co2 = json.load(open("data/co2_curve/co2_curve.json"))
 
-# глобальна середня, зважена на площу клітинки (cos широти)
+# global mean, weighted by cell area (cos of latitude)
 w = np.cos(np.radians(lat))[None, :, None] * np.ones_like(A)
 w[np.isnan(A)] = 0
 glob = np.nansum(np.nan_to_num(A) * w, (1, 2)) / w.sum((1, 2))
@@ -35,44 +35,44 @@ glob = np.nansum(np.nan_to_num(A) * w, (1, 2)) / w.sum((1, 2))
 fig = plt.figure(figsize=(15, 10), layout="constrained")
 gs = fig.add_gridspec(2, 2)
 
-# 1) карта аномалії за 2025 (останній повний рік)
+# 1) anomaly map for 2025 (the last full year)
 ax = fig.add_subplot(gs[0, 0])
 y = 2025
 im = ax.imshow(A[years == y][0], origin="lower", extent=[-180, 180, -90, 90], cmap=div,
                norm=TwoSlopeNorm(0, -3, 3), aspect="auto")
-ax.set_title(f"temperature: аномалія {y} року відносно 1951–1980")
-ax.set_xlabel("довгота, °"); ax.set_ylabel("широта, °")
+ax.set_title(f"temperature: {y} anomaly vs 1951–1980")
+ax.set_xlabel("longitude, °"); ax.set_ylabel("latitude, °")
 fig.colorbar(im, ax=ax, label="°C", shrink=0.85, extend="both")
 
-# 2) карта 1900 — видно прогалини в даних
+# 2) map for 1900 - gaps in the data are visible
 ax = fig.add_subplot(gs[0, 1])
 y = 1900
 im = ax.imshow(A[years == y][0], origin="lower", extent=[-180, 180, -90, 90], cmap=div,
                norm=TwoSlopeNorm(0, -3, 3), aspect="auto")
-ax.set_title(f"temperature: {y} рік (сірим — немає вимірювань)")
-ax.set_xlabel("довгота, °"); ax.set_ylabel("широта, °")
+ax.set_title(f"temperature: year {y} (grey - no measurements)")
+ax.set_xlabel("longitude, °"); ax.set_ylabel("latitude, °")
 fig.colorbar(im, ax=ax, label="°C", shrink=0.85, extend="both")
 
-# 3) глобальна аномалія по роках
+# 3) global anomaly by year
 ax = fig.add_subplot(gs[1, 0])
 full = years <= 2025
 ax.axhline(0, color=GRID, lw=1)
 ax.plot(years[full], glob[full], color=RED, lw=2)
 ax.plot(years[~full], glob[~full], "o", color=RED, mfc="white", ms=6)
-ax.annotate("2026: неповний рік", (years[-1], glob[-1]), xytext=(-110, 12), textcoords="offset points",
+ax.annotate("2026: partial year", (years[-1], glob[-1]), xytext=(-110, 12), textcoords="offset points",
             color=INK2, fontsize=9, arrowprops=dict(arrowstyle="-", color=MUTED, lw=0.8))
-ax.set_title("temperature: середня по планеті (суша + океан)")
-ax.set_ylabel("аномалія, °C"); ax.grid(axis="y", color=GRID, lw=0.6)
+ax.set_title("temperature: planet-wide mean (land + ocean)")
+ax.set_ylabel("anomaly, °C"); ax.grid(axis="y", color=GRID, lw=0.6)
 
-# 4) CO2: помісячно + річні
+# 4) CO2: monthly + yearly
 ax = fig.add_subplot(gs[1, 1])
 mo = co2["monthly"]
 t = np.array(mo["year"]) + (np.array(mo["month"]) - 0.5) / 12
-ax.plot(t, mo["ppm"], color=BLUE_L, lw=1, label="щомісяця (видно сезонне «дихання»)")
-ax.plot(np.array(co2["years"][:-1]) + 0.5, co2["values"][:-1], color=BLUE, lw=2, label="середнє за рік")
-ax.set_title("co2_curve: CO₂ на Мауна-Лоа, 1958–2026")
+ax.plot(t, mo["ppm"], color=BLUE_L, lw=1, label="monthly (seasonal 'breathing' is visible)")
+ax.plot(np.array(co2["years"][:-1]) + 0.5, co2["values"][:-1], color=BLUE, lw=2, label="yearly average")
+ax.set_title("co2_curve: CO₂ at Mauna Loa, 1958–2026")
 ax.set_ylabel("ppm"); ax.grid(axis="y", color=GRID, lw=0.6); ax.legend(frameon=False, loc="upper left")
 
-fig.suptitle("Шари Earth Jukebox: що лежить у data/temperature і data/co2_curve", fontsize=14, fontweight="bold")
+fig.suptitle("Earth Jukebox layers: what is inside data/temperature and data/co2_curve", fontsize=14, fontweight="bold")
 fig.savefig("jukebox_data_overview.png", dpi=120)
 print("saved jukebox_data_overview.png")

@@ -1,13 +1,13 @@
-"""Озвучення точки: де це (країна / море / природний регіон), коли (рік або дата) і що там у даних.
+"""Spoken description of a point: where (country / sea / natural region), when (year or date), what the data says.
 
-    geo = Geocoder()                          # офлайн, контури Natural Earth з українськими назвами
+    geo = Geocoder()                          # offline, Natural Earth outlines with English names
     text = compose(layer, t, lat, lon, sample, geo.locate(lat, lon))
-    Speaker().speak(text)                     # macOS `say`, голос Lesya (uk_UA)
+    Speaker().speak(text)                     # macOS `say`, best installed English voice
 
-Приклад: "Ефіопія, північна частина. Східна Африка. 2025 рік. Аномалія температури: плюс 1,3 градуса.
-Це відхилення від норми 1951–1980 років."
+Example: "Central Ethiopia. Eastern Africa. Natural region: Ethiopian Highlands. Year 2025.
+Temperature anomaly: plus 1.28 degrees. This is the departure from the 1951 to 1980 average."
 
-Дані (у data/, завантажуються один раз):
+Data (in data/, downloaded once):
   ne_50m_admin_0_countries.geojson, ne_50m_geography_marine_polys.geojson,
   ne_50m_geography_regions_polys.geojson  - https://github.com/nvkelso/natural-earth-vector
 """
@@ -26,25 +26,19 @@ NE_URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/
 NE_FILES = {"countries": "ne_50m_admin_0_countries", "marine": "ne_50m_geography_marine_polys",
             "regions": "ne_50m_geography_regions_polys"}
 
-SUBREGIONS_UA = {
-    "Eastern Africa": "Східна Африка", "Middle Africa": "Центральна Африка", "Northern Africa": "Північна Африка",
-    "Southern Africa": "південь Африки", "Western Africa": "Західна Африка",
-    "Caribbean": "Карибський регіон", "Central America": "Центральна Америка", "South America": "Південна Америка",
-    "Northern America": "Північна Америка",
-    "Central Asia": "Центральна Азія", "Eastern Asia": "Східна Азія", "South-Eastern Asia": "Південно-Східна Азія",
-    "Southern Asia": "Південна Азія", "Western Asia": "Західна Азія",
-    "Eastern Europe": "Східна Європа", "Northern Europe": "Північна Європа", "Southern Europe": "Південна Європа",
-    "Western Europe": "Західна Європа",
-    "Australia and New Zealand": "Австралія та Нова Зеландія", "Melanesia": "Меланезія", "Micronesia": "Мікронезія",
-    "Polynesia": "Полінезія", "Antarctica": "Антарктида",
-}
 PHYSICAL = {"Desert", "Range/mtn", "Plateau", "Basin", "Plain", "Tundra", "Peninsula", "Pen/cape", "Delta",
             "Lowland", "Valley", "Wetlands", "Foothills"}
-MONTHS_GEN = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня",
-              "листопада", "грудня"]
-PARTS = {(0, 0): "центральна частина", (1, 0): "північна частина", (-1, 0): "південна частина",
-         (0, 1): "східна частина", (0, -1): "західна частина", (1, 1): "північно-східна частина",
-         (1, -1): "північно-західна частина", (-1, 1): "південно-східна частина", (-1, -1): "південно-західна частина"}
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December"]
+PARTS = {(0, 0): "central", (1, 0): "northern", (-1, 0): "southern", (0, 1): "eastern", (0, -1): "western",
+         (1, 1): "north-eastern", (1, -1): "north-western", (-1, 1): "south-eastern", (-1, -1): "south-western"}
+# Voices that sound natural, best first. Premium/Enhanced voices (if installed) are preferred automatically.
+PREFERRED_VOICES = ["Samantha", "Daniel", "Karen", "Moira", "Tessa", "Rishi"]
+
+
+def _cap(s):
+    """Upper-case only the first letter (str.capitalize() would lower-case month names)."""
+    return s[:1].upper() + s[1:]
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -56,27 +50,27 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 
 def _clean(name):
     name = (name or "").strip()
-    return name.title() if name.isupper() else name             # "САХЕЛ" -> "Сахел"
+    return name.title() if name.isupper() else name             # "SAHEL" -> "Sahel"
 
 
 def ensure_data(data_dir=DATA_DIR):
-    """Завантажує контури Natural Earth, якщо їх ще немає. -> True, якщо всі файли на місці."""
+    """Download the Natural Earth outlines if missing. -> True if all files are present."""
     import urllib.request
     ok = True
     for f in NE_FILES.values():
         p = Path(data_dir) / f"{f}.geojson"
         if not p.exists():
             try:
-                print(f"  завантаження {p.name} ...")
+                print(f"  downloading {p.name} ...")
                 urllib.request.urlretrieve(NE_URL.format(f), p)
             except Exception as e:
-                print(f"  не вдалося завантажити {p.name}: {e}")
+                print(f"  could not download {p.name}: {e}")
                 ok = False
     return ok
 
 
 class _Shapes:
-    """Полігони з українськими назвами + швидка перевірка 'точка всередині'."""
+    """Polygons with names + fast point-in-polygon."""
 
     def __init__(self, path, name_keys, filt=None, extra=None):
         self.items = []
@@ -93,14 +87,14 @@ class _Shapes:
             polys = [g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]
             rings = [np.asarray(p[0], float) for p in polys]
             allpts = np.vstack(rings)
-            area = sum(abs(np.dot(r[:, 0], np.roll(r[:, 1], 1)) - np.dot(r[:, 1], np.roll(r[:, 0], 1))) / 2 for r in rings)
-            biggest = max(rings, key=lambda r: abs(np.dot(r[:, 0], np.roll(r[:, 1], 1)) - np.dot(r[:, 1], np.roll(r[:, 0], 1))))
+            area_of = lambda r: abs(np.dot(r[:, 0], np.roll(r[:, 1], 1)) - np.dot(r[:, 1], np.roll(r[:, 0], 1))) / 2
+            biggest = max(rings, key=area_of)
             self.items.append({
-                "name": name, "props": props, "area": area,
+                "name": name, "props": props, "area": sum(area_of(r) for r in rings),
                 "bbox": (allpts[:, 0].min(), allpts[:, 1].min(), allpts[:, 0].max(), allpts[:, 1].max()),
                 "paths": [(MplPath(r), (r[:, 0].min(), r[:, 1].min(), r[:, 0].max(), r[:, 1].max())) for r in rings],
                 "main_bbox": (biggest[:, 0].min(), biggest[:, 1].min(), biggest[:, 0].max(), biggest[:, 1].max()),
-                "verts": allpts[:: max(1, len(allpts) // 400)],             # для відстані "поруч"
+                "verts": allpts[:: max(1, len(allpts) // 400)],
                 **(extra(props) if extra else {}),
             })
 
@@ -113,7 +107,7 @@ class _Shapes:
                     if a <= lon <= c and b <= lat <= d and path.contains_point((lon, lat)):
                         hits.append(it)
                         break
-        return sorted(hits, key=lambda it: it["area"])               # найдрібніший (найконкретніший) перший
+        return sorted(hits, key=lambda it: it["area"])               # smallest (most specific) first
 
     def nearest(self, lat, lon, max_km):
         best = None
@@ -133,18 +127,18 @@ class Geocoder:
         if download:
             ensure_data(data_dir)
         d = Path(data_dir)
-        self.countries = _Shapes(d / f"{NE_FILES['countries']}.geojson", ["NAME_UK", "NAME"],
-                                 extra=lambda p: {"subregion": SUBREGIONS_UA.get(p.get("SUBREGION"), "")})
-        self.marine = _Shapes(d / f"{NE_FILES['marine']}.geojson", ["name_uk", "name"])
-        self.regions = _Shapes(d / f"{NE_FILES['regions']}.geojson", ["NAME_UK", "NAME"],
+        self.countries = _Shapes(d / f"{NE_FILES['countries']}.geojson", ["NAME", "NAME_EN"],
+                                 extra=lambda p: {"subregion": p.get("SUBREGION") or ""})
+        self.marine = _Shapes(d / f"{NE_FILES['marine']}.geojson", ["name_en", "name"])
+        self.regions = _Shapes(d / f"{NE_FILES['regions']}.geojson", ["NAME_EN", "NAME"],
                                filt=lambda p: p.get("FEATURECLA") in PHYSICAL)
         self.ready = bool(self.countries.items)
 
     @staticmethod
     def _part(it, lat, lon):
-        """Яка частина країни: за положенням точки в рамці основної території (для великих країн)."""
+        """Which part of the country, by position in the main territory's box (large countries only)."""
         x0, y0, x1, y1 = it["main_bbox"]
-        if (x1 - x0) < 5 and (y1 - y0) < 5:                           # маленька країна - без "частин"
+        if (x1 - x0) < 5 and (y1 - y0) < 5:
             return ""
         if not (x0 <= lon <= x1 and y0 <= lat <= y1):
             return ""
@@ -173,57 +167,47 @@ class Geocoder:
         return out
 
 
+def _spoken_coord(loc):
+    lat, lon = loc["lat"], loc["lon"]
+    return (f"{abs(lat):.0f} degrees {'north' if lat >= 0 else 'south'}, "
+            f"{abs(lon):.0f} degrees {'east' if lon >= 0 else 'west'}")
+
+
 def place_phrase(loc):
-    """Опис місця українською без відмінювання назв (щоб не помилятись у відмінках)."""
+    """The place in plain English: "Central Ethiopia. Eastern Africa. Natural region: Ethiopian Highlands." """
     if loc is None:
-        return f"Координати {_spoken_coord(loc)}."
+        return "Position unknown."
     bits = []
     if loc["country"]:
-        bits.append(loc["country"] + (f", {loc['part']}" if loc["part"] else ""))
-        if loc["subregion"] and loc["subregion"] != loc["country"]:
+        bits.append(f"{loc['part']} {loc['country']}".strip())
+        if loc["subregion"] and loc["subregion"] != loc["country"] and "Seven seas" not in loc["subregion"]:
             bits.append(loc["subregion"])
     else:
-        bits.append(loc["sea"] or "Відкритий океан")
+        bits.append(loc["sea"] or "Open ocean")
         if loc["near_country"]:
             km = int(round(loc["near_km"] / 10) * 10) if loc["near_km"] >= 30 else None
-            bits.append(f"найближча країна: {loc['near_country']}" + (f", приблизно {km} кілометрів" if km else ""))
+            bits.append(f"nearest country: {loc['near_country']}" + (f", about {km} kilometers away" if km else ""))
     if loc["region"] and loc["region"] not in bits[0]:
-        bits.append(f"природний регіон: {loc['region']}")
+        bits.append(f"natural region: {loc['region']}")
     return ". ".join(b[0].upper() + b[1:] for b in bits) + "."
 
 
-def _spoken_coord(loc):
-    lat, lon = loc["lat"], loc["lon"]
-    return (f"{abs(lat):.0f} градусів {'північної' if lat >= 0 else 'південної'} широти, "
-            f"{abs(lon):.0f} градусів {'східної' if lon >= 0 else 'західної'} довготи")
-
-
 # ----------------------------------------------------------------------------
-# Числа й одиниці так, як їх треба вимовляти
+# Numbers and units the way they should be spoken
 # ----------------------------------------------------------------------------
-def _plural(n, one, few, many):
-    n = abs(int(n))
-    if n % 10 == 1 and n % 100 != 11:
-        return one
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return few
-    return many
-
-
 def spoken_number(v, decimals, signed=False):
-    s = f"{abs(v):.{decimals}f}".replace(".", ",")
-    sign = ("плюс " if v > 0 else "мінус " if v < 0 else "") if signed else ("мінус " if v < 0 else "")
+    s = f"{abs(v):.{decimals}f}"
+    sign = ("plus " if v > 0 else "minus " if v < 0 else "") if signed else ("minus " if v < 0 else "")
     return sign + s
 
 
 def spoken_quantity(v, unit, decimals, signed=False):
     fractional = decimals > 0 and round(abs(v), decimals) != int(round(abs(v), decimals))
-    num = spoken_number(v, decimals if fractional else 0, signed)    # "21 градус", а не "21,0 градус"
+    num = spoken_number(v, decimals if fractional else 0, signed)    # "21 degrees", not "21.0 degrees"
     if unit in ("°C", "°"):
-        word = "градуса" if fractional else _plural(round(abs(v)), "градус", "градуси", "градусів")
-        return f"{num} {word}"
+        return f"{num} degree" if num.split()[-1] == "1" else f"{num} degrees"
     if unit == "ppm":
-        return f"{num} мільйонних часток"
+        return f"{num} parts per million"
     return f"{num} {unit}".strip()
 
 
@@ -234,166 +218,180 @@ def _decimals(fmt):
 
 def spoken_time(layer, t):
     if not layer.dynamic:
-        return (layer.cfg.get("static_label") or "").capitalize()
+        return _cap(layer.cfg.get("static_label") or "")
     lab = layer.labels[layer.clamp_frame(t)]
-    if layer.has_dates:                                          # "28.03.2007" -> "28 березня 2007 року"
+    if layer.has_dates:                                          # "28.03.2007" -> "March 28, 2007"
         d, m, y = lab.split(".")
-        s = f"{int(d)} {MONTHS_GEN[int(m) - 1]} {y} року"
+        s = f"{MONTHS[int(m) - 1]} {int(d)}, {y}"
     else:
-        s = f"{lab} рік"
+        s = f"Year {lab}"
     if int(layer.times[layer.clamp_frame(t)]) in layer.partial_years:
-        s += ", неповні дані за рік"
+        s += ", partial data for this year"
     return s
 
 
 def _spoken_years(text):
-    return re.sub(r"(\d{4})\s*[–-]\s*(\d{4})", r"\1–\2 років", text)
+    return re.sub(r"(\d{4})\s*[–-]\s*(\d{4})", r"\1 to \2", text)
 
 
 def compose(layer, t, lat, lon, sample, loc=None):
-    """Повне повідомлення для озвучення: місце. час. значення. порівняння з нормою. примітка."""
-    parts = [place_phrase(loc) if loc else f"Точка: {_spoken_coord({'lat': lat, 'lon': lon})}."]
+    """The full message: place. time. layer value. comparison with the baseline. layer note."""
+    parts = [place_phrase(loc) if loc else f"Position: {_spoken_coord({'lat': lat, 'lon': lon})}."]
     when = spoken_time(layer, t)
     if when:
         parts.append(when + ".")
-    title = re.sub(r"\s*\([^)]*\)", "", layer.title).strip()      # без пояснень у дужках
+    title = spoken_title(layer)
     if sample is None or sample["missing"]:
-        parts.append(f"{title}: даних у цій точці немає.")
+        parts.append(f"{title}: no data at this spot.")
         return " ".join(parts)
     dec = _decimals(layer.fmt)
     signed = "+" in layer.fmt
     value = spoken_quantity(sample["value"], layer.unit, dec, signed)
     if sample.get("clipped", 0) > 0:
-        value = "понад " + value
+        value = "more than " + value
     elif sample.get("clipped", 0) < 0:
-        value = "менше ніж " + value
+        value = "less than " + value
     parts.append(f"{title}: {value}.")
     base = sample.get("base")
     trivial = getattr(layer, "baseline_grid", None) is None and base == 0.0
     if base is not None and not trivial:
         diff = sample["value"] - base
         if abs(diff) < 0.5 * 10 ** -dec:
-            parts.append(f"Це як {_spoken_years(layer.base_label)}.")
+            parts.append(f"That is the same as {_spoken_years(layer.base_label)}.")
         else:
-            parts.append(f"Це на {spoken_quantity(abs(diff), layer.unit, dec)} "
-                         f"{'вище' if diff > 0 else 'нижче'}, ніж {_spoken_years(layer.base_label)}.")
+            parts.append(f"That is {spoken_quantity(abs(diff), layer.unit, dec)} "
+                         f"{'above' if diff > 0 else 'below'} {_spoken_years(layer.base_label)}.")
     note = layer.cfg.get("speech_note")
     if note:
         parts.append(_spoken_years(note))
     if sample.get("near_km"):
-        parts.append(f"Значення з найближчої клітинки з даними, за {int(round(sample['near_km'] / 10) * 10)} кілометрів.")
+        parts.append(f"Value taken from the nearest cell with data, "
+                     f"about {int(round(sample['near_km'] / 10) * 10)} kilometers away.")
     return " ".join(parts)
 
 
 # ----------------------------------------------------------------------------
-# Оголошення: перелік карт, довідка, перемикання карти
+# Announcements: list of maps, help, switching maps
 # ----------------------------------------------------------------------------
-MONTHS_NOM = ["січень", "лютий", "березень", "квітень", "травень", "червень", "липень", "серпень", "вересень",
-              "жовтень", "листопад", "грудень"]
-
-
 def spoken_title(layer_or_title):
     title = layer_or_title if isinstance(layer_or_title, str) else layer_or_title.title
     return re.sub(r"\s*\([^)]*\)", "", title).strip()
 
 
 def spoken_range(layer):
-    """Період даних шару: "з 1880 по 2026 рік, 147 років" / "з березня 2007 по лютий 2008 року, 48 тижневих кадрів"."""
+    """Time span of a layer: "from 1880 to 2026, 147 years" / "from March 2007 to February 2008, 48 weekly frames"."""
     if not layer.dynamic:
-        return (layer.cfg.get("static_label") or "один момент часу") + ", один момент часу"
+        return (layer.cfg.get("static_label") or "a single moment") + ", a single snapshot"
     a, b = layer.labels[0], layer.labels[-1]
     if layer.has_dates:
         _, m1, y1 = a.split("."); _, m2, y2 = b.split(".")
         step = (layer.times[-1] - layer.times[0]) / max(layer.n_frames - 1, 1) * 365
-        kind = "тижневих" if step < 10 else "місячних" if step < 40 else ""
-        return (f"з {MONTHS_GEN[int(m1) - 1]} {y1} по {MONTHS_NOM[int(m2) - 1]} {y2} року, "
-                f"{layer.n_frames} {kind} кадрів".replace("  ", " "))
-    n = layer.n_frames
-    return f"з {a} по {b} рік, {n} {_plural(n, 'рік', 'роки', 'років')}"
+        kind = "weekly " if step < 10 else "monthly " if step < 40 else ""
+        return f"from {MONTHS[int(m1) - 1]} {y1} to {MONTHS[int(m2) - 1]} {y2}, {layer.n_frames} {kind}frames"
+    return f"from {a} to {b}, {layer.n_frames} years"
 
 
 def layer_intro(idx, n, layer, surface="map"):
-    """Коротко при перемиканні: "Карта 2 з 4: Активність течій з відео NASA. З березня 2007 по ...". """
-    s = f"Карта {idx} з {n}: {spoken_title(layer)}. {spoken_range(layer).capitalize()}."
+    """Short message when switching maps."""
+    s = f"Map {idx} of {n}: {spoken_title(layer)}. {_cap(spoken_range(layer))}."
     if layer.dynamic:
-        s += (" Час змінюйте лівою рукою вздовж карти." if surface == "map"
-              else " Час змінюйте клавішами кома і крапка.")
+        s += (" Move your left hand along the map to change the time." if surface == "map"
+              else " Use comma and period to change the time.")
     return s
 
 
 def layers_announcement(specs, current_idx, load=True):
-    """Перелік усіх карт з номерами і періодами; яка обрана зараз; як перемкнути."""
+    """All maps with numbers and time spans; which one is selected; how to switch."""
     n = len(specs)
-    parts = [f"Доступно {n} {_plural(n, 'карта', 'карти', 'карт')}."]
+    parts = [f"There {'is' if n == 1 else 'are'} {n} map{'s' if n != 1 else ''}."]
     for k, s in enumerate(specs, 1):
         lay = s.load() if load else None
         rng = f", {spoken_range(lay)}" if lay is not None else ""
-        parts.append(f"Карта {k}: {spoken_title(lay or s.title)}{rng}.")
-    parts.append(f"Зараз обрано карту {current_idx}.")
-    parts.append(f"Щоб обрати карту, натисніть цифру від 1 до {min(n, 9)}, або клавішу ел для наступної карти.")
+        parts.append(f"Map {k}: {spoken_title(lay or s.title)}{rng}.")
+    parts.append(f"Map {current_idx} is selected.")
+    parts.append(f"To choose a map, press a number from 1 to {min(n, 9)}, or press L for the next map.")
     return " ".join(parts)
 
 
+_SOUND_EXPLAINED = ("The pitch tells you the value at that spot: a higher sound means a higher value. "
+                    "If the sound pulses, the value is above normal. "
+                    "You hear the sound on the left when your finger is in the west, and on the right in the east.")
+
+
 def help_announcement(keys, n_layers, surface="map"):
-    """Що робить програма і які клавіші що роблять. keys: [(клавіша, як вимовити, що робить)]."""
+    """What the program does and what each key does. keys: [(key, how to say it, what it does)]."""
     if surface == "virtual":
-        intro = ("Earth Jukebox, звукова карта Землі. На екрані поверх зображення з камери намальовано глобус. "
-                 "Показуйте на нього вказівним пальцем правої руки: висота звуку показує значення в цьому місці, "
-                 "вищий звук означає більше значення. Якщо звук пульсує, значення вище за норму. "
-                 "Ліворуч звук чути, коли палець на заході, праворуч, коли на сході. "
-                 "Щоб обернути глобус, лівою рукою зведіть великий і вказівний пальці, ніби берете його, "
-                 "і ведіть рукою. Розведіть пальці, щоб відпустити. "
-                 "Затримайте правий палець на три секунди, і я назву місце, час і значення. "
-                 "Час змінюйте клавішами: кома і крапка, крок назад і вперед.")
-        keys_txt = " ".join(f"{spoken.capitalize()}: {what}." for _, spoken, what in keys)
-        return f"{intro} Клавіші. {keys_txt}".replace("{n}", str(min(n_layers, 9)))
-    if surface == "globe":
-        intro = ("Earth Jukebox, звукова карта Землі. Камера бачить глобус і вашу праву руку. "
-                 "Показуйте вказівним пальцем правої руки на будь-яке місце глобуса: висота звуку показує "
-                 "значення в цьому місці, вищий звук означає більше значення. Якщо звук пульсує, значення "
-                 "вище за норму. Ліворуч звук чути, коли палець на заході, праворуч, коли на сході. "
-                 "Глобус можна крутити і переставляти, програма сама його знаходить. "
-                 "Затримайте палець на три секунди, і я назву місце, час і значення. "
-                 "Час змінюйте клавішами: кома і крапка, крок назад і вперед.")
-        keys_txt = " ".join(f"{spoken.capitalize()}: {what}." for _, spoken, what in keys)
-        return f"{intro} Клавіші. {keys_txt}".replace("{n}", str(min(n_layers, 9)))
-    intro = ("Earth Jukebox, звукова карта Землі. Камера бачить паперову карту світу і ваші руки. "
-             "Правим вказівним пальцем водіть по карті: висота звуку показує значення в цьому місці, "
-             "вищий звук означає більше значення. Якщо звук пульсує, значення вище за норму. "
-             "Ліворуч звук чути, коли палець на заході, праворуч, коли на сході. "
-             "Затримайте правий палець на три секунди, і я назву місце, час і значення. "
-             "Лівим вказівним пальцем ведіть уздовж карти, щоб змінювати час: "
-             "лівий край карти означає найдавніші дані, правий край найновіші.")
-    keys_txt = " ".join(f"{spoken.capitalize()}: {what}." for _, spoken, what in keys)
-    return f"{intro} Клавіші. {keys_txt}".replace("{n}", str(min(n_layers, 9)))
+        intro = ("Earth Jukebox, a sound map of the Earth. A globe is drawn on top of the camera picture. "
+                 "Point at it with the index finger of your right hand. " + _SOUND_EXPLAINED + " "
+                 "To turn the globe, pinch your left thumb and index finger together, as if you were holding it, "
+                 "and move your hand. Open your fingers to let go. "
+                 "Hold your right finger still for three seconds, and I will tell you the place, the time, "
+                 "and the value. Change the time with the comma and period keys.")
+    elif surface == "globe":
+        intro = ("Earth Jukebox, a sound map of the Earth. The camera sees the globe and your right hand. "
+                 "Point at any place on the globe with your right index finger. " + _SOUND_EXPLAINED + " "
+                 "You can spin the globe and move it around, the program finds it by itself. "
+                 "Hold your finger still for three seconds, and I will tell you the place, the time, and the value. "
+                 "Change the time with the comma and period keys.")
+    else:
+        intro = ("Earth Jukebox, a sound map of the Earth. The camera sees a paper world map and your hands. "
+                 "Move your right index finger over the map. " + _SOUND_EXPLAINED + " "
+                 "Hold your right finger still for three seconds, and I will tell you the place, the time, "
+                 "and the value. Slide your left index finger along the map to change the time: "
+                 "the left edge is the oldest data, the right edge is the newest.")
+    keys_txt = " ".join(f"{spoken[0].upper() + spoken[1:]}: {what}." for _, spoken, what in keys)
+    return f"{intro} Keys. {keys_txt}".replace("{n}", str(min(n_layers, 9)))
 
 
 # ----------------------------------------------------------------------------
-# Голос
+# Voice
 # ----------------------------------------------------------------------------
+def english_voices():
+    """Installed English voices of macOS `say`: [(name, locale)], best first."""
+    try:
+        out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    voices = []
+    for line in out.splitlines():
+        m = re.match(r"^(.+?)\s+(en_[A-Z]{2})\s", line)
+        if m:
+            voices.append((m.group(1).strip(), m.group(2)))
+
+    def rank(v):
+        name = v[0]
+        if "Premium" in name:
+            return 0
+        if "Enhanced" in name:
+            return 1
+        base = name.split(" (")[0]
+        return 2 + (PREFERRED_VOICES.index(base) if base in PREFERRED_VOICES and "(" not in name else 50)
+    return sorted(voices, key=rank)
+
+
 class Speaker:
-    """Озвучення через macOS `say` (голос Lesya, українська). Не блокує програму."""
+    """Speech via macOS `say` with the most natural installed English voice. Non-blocking."""
 
-    def __init__(self, enabled=True, voice="Lesya", rate=185):
-        self.voice, self.rate, self.proc = voice, rate, None
+    def __init__(self, enabled=True, voice="auto", rate=175):
+        self.voice, self.rate, self.proc = None, rate, None
         self.enabled = False
         if not enabled:
             return
         if not shutil.which("say"):
-            print("  Голос вимкнено: немає команди `say` (не macOS).")
+            print("  Voice off: the `say` command is not available (not macOS).")
             return
-        try:
-            voices = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
-        except Exception as e:
-            print(f"  Голос вимкнено: {e}")
-            return
-        if not re.search(rf"^{re.escape(voice)}\s", voices, re.M):
-            uk = re.findall(r"^(\S+)\s+uk_UA", voices, re.M)
-            if not uk:
-                print("  Голос вимкнено: немає українського голосу. Додайте Lesya: Системні параметри -> "
-                      "Доступність -> Вміст мовлення -> Системний голос -> Керувати голосами.")
+        voices = english_voices()
+        names = [v[0] for v in voices]
+        if voice and voice != "auto":
+            if voice not in names:
+                print(f"  Voice '{voice}' is not installed; using the best available English voice.")
+            else:
+                self.voice = voice
+        if self.voice is None:
+            if not voices:
+                print("  Voice off: no English voice installed.")
                 return
-            self.voice = uk[0]
+            self.voice = voices[0][0]
         self.enabled = True
 
     def speak(self, text):
@@ -412,7 +410,7 @@ class Speaker:
         self.proc = None
 
     def to_file(self, text, path):
-        """Записати озвучення у файл (для тестів і плейлиста). -> True, якщо вдалося."""
+        """Render speech to a file (tests, playlist). -> True on success."""
         if not self.enabled:
             return False
         r = subprocess.run(["say", "-v", self.voice, "-r", str(self.rate), "-o", str(path), text],

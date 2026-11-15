@@ -1,14 +1,14 @@
-"""Глобус на підставці з віссю: піксель пальця -> широта/довгота; відстеження повороту глобуса.
+"""Globe on a stand with an axis: finger pixel -> latitude/longitude; tracking of the globe's rotation.
 
-Модель:
-  * камера-пінхол: фокус f (пікселі), головна точка = центр кадру;
-  * куля радіуса 1, центр C знаходиться з обрису кулі в кадрі (центр і радіус кола);
-  * орієнтація глобуса R(θ) = R0 · Rz(θ): R0 - з калібрування за знайомими місцями (метод Кабша),
-    θ - кут обертання навколо полярної осі. Підставка тримає вісь, тож щокадру шукається лише θ.
+Model:
+  * pinhole camera: focal length f (pixels), principal point = frame centre;
+  * sphere of radius 1, its centre C is found from the sphere outline in the frame (circle centre and radius);
+  * globe orientation R(θ) = R0 · Rz(θ): R0 - from calibration with known places (Kabsch method),
+    θ - rotation angle about the polar axis. The stand holds the axis, so only θ is searched each frame.
 
-Відстеження θ: маска "вода/суша" з кольору кадру (модель кольору вивчається з вашого глобуса
-під час калібрування) порівнюється з контурами суші Natural Earth для всіх кутів 0..360°.
-Пікселі під рукою не враховуються. Без міток і без накопичення похибки.
+Tracking θ: a "water/land" mask from the frame colours (the colour model is learned from your globe
+during calibration) is compared with the Natural Earth land outlines for all angles 0..360°.
+Pixels under the hand are ignored. No markers and no accumulating error.
 """
 import json
 from pathlib import Path
@@ -20,11 +20,11 @@ HERE = Path(__file__).resolve().parent
 LAND_FILE = HERE / "data" / "ne_50m_land.geojson"
 GLOBE_CALIB = HERE / "globe_calibration.json"
 GLOBE_VERSION = 1
-RES = 0.25                       # роздільність растру суші, градуси
+RES = 0.25                       # land raster resolution, degrees
 
 
 # ----------------------------------------------------------------------------
-# Вектори і повороти
+# Vectors and rotations
 # ----------------------------------------------------------------------------
 def latlon_to_vec(lat, lon):
     la, lo = np.radians(np.asarray(lat, float)), np.radians(np.asarray(lon, float))
@@ -42,7 +42,7 @@ def rot_z(theta_deg):
 
 
 def kabsch(a, b):
-    """R, що мінімізує Σ|R a_i - b_i|² (a, b: N×3)."""
+    """R that minimizes Σ|R a_i - b_i|² (a, b: N×3)."""
     H = np.asarray(a).T @ np.asarray(b)
     U, _, Vt = np.linalg.svd(H)
     d = np.sign(np.linalg.det(Vt.T @ U.T))
@@ -54,7 +54,7 @@ def angdiff(a, b):
 
 
 # ----------------------------------------------------------------------------
-# Геометрія камера + куля
+# Camera + sphere geometry
 # ----------------------------------------------------------------------------
 class GlobeGeometry:
     def __init__(self, center_px, radius_px, f, frame_wh):
@@ -64,12 +64,12 @@ class GlobeGeometry:
         self.cx, self.cy = self.W / 2.0, self.H / 2.0
         d = np.array([(self.u0 - self.cx) / self.f, (self.v0 - self.cy) / self.f, 1.0])
         d /= np.linalg.norm(d)
-        alpha = np.arctan(self.r / self.f)                    # кутовий радіус кулі
-        self.C = d / np.sin(alpha)                             # центр кулі (радіус 1) у системі камери
+        alpha = np.arctan(self.r / self.f)                    # angular radius of the sphere
+        self.C = d / np.sin(alpha)                             # sphere centre (radius 1) in camera coordinates
 
     @classmethod
     def from_center(cls, C, f, frame_wh):
-        """Геометрія з відомого 3D-центру кулі (напр. з PnP), а не з кола в кадрі."""
+        """Geometry from a known 3D sphere centre (e.g. from PnP), not from a circle in the frame."""
         g = cls((0, 0), 1, f, frame_wh)
         g.set_center(C)
         return g
@@ -89,18 +89,18 @@ class GlobeGeometry:
         return d / np.linalg.norm(d, axis=-1, keepdims=True)
 
     def hit(self, px, py):
-        """Піксель -> (P: одинична нормаль у системі камери, ok: промінь влучив у кулю, facing: cos кута огляду)."""
+        """Pixel -> (P: unit normal in camera coordinates, ok: the ray hits the sphere, facing: cos of the view angle)."""
         d = self.rays(px, py)
         b = d @ self.C
         disc = b * b - (self.C @ self.C - 1.0)
         ok = disc >= 0
         t = b - np.sqrt(np.maximum(disc, 0))
         P = t[..., None] * d - self.C
-        facing = -(P * d).sum(-1)                              # 1 = дивимось прямо, 0 = край кулі
+        facing = -(P * d).sum(-1)                              # 1 = looking straight on, 0 = edge of the sphere
         return P, ok, facing
 
     def project(self, P):
-        """Нормалі P (N×3, система камери) -> пікселі і видимість (передня півкуля)."""
+        """Normals P (N×3, camera coordinates) -> pixels and visibility (front hemisphere)."""
         S = self.C + P
         vis = (P * S).sum(-1) < 0
         return self.f * S[..., 0] / S[..., 2] + self.cx, self.f * S[..., 1] / S[..., 2] + self.cy, vis
@@ -114,8 +114,8 @@ def fov_to_f(fov_deg, width):
 
 
 def solve_pose(clicks_px, latlons, center, radius, frame_wh, f=None, default_fov=65.0):
-    """Знайомі місця (кліки + lat/lon) -> (geometry, R0, середня похибка в градусах).
-    Якщо f не задано і точок ≥ 4, фокус підбирається за найменшою похибкою (поле зору 30..100°)."""
+    """Known places (clicks + lat/lon) -> (geometry, R0, mean error in degrees).
+    If f is not given and there are ≥ 4 points, the focal length is chosen by the smallest error (field of view 30..100°)."""
     clicks = np.asarray(clicks_px, float)
     G = latlon_to_vec(np.asarray(latlons)[:, 0], np.asarray(latlons)[:, 1])
     if f is not None:
@@ -135,12 +135,12 @@ def solve_pose(clicks_px, latlons, center, radius, frame_wh, f=None, default_fov
         if best is None or err.mean() < best[2]:
             best = (geom, R, float(err.mean()), err)
     if best is None:
-        raise ValueError("Замало кліків усередині глобуса (потрібно ≥ 3)")
+        raise ValueError("Too few clicks inside the globe (need ≥ 3)")
     return best[0], best[1], best[2]
 
 
 # ----------------------------------------------------------------------------
-# Растр суші (Natural Earth) і контури для накладання
+# Land raster (Natural Earth) and outlines for the overlay
 # ----------------------------------------------------------------------------
 _LAND = {}
 
@@ -156,7 +156,7 @@ def land_rings(path=LAND_FILE):
 
 
 def land_raster(res=RES, path=LAND_FILE):
-    """bool[180/res, 360/res]: рядок 0 = 90°N, стовпець 0 = 180°W."""
+    """bool[180/res, 360/res]: row 0 = 90°N, column 0 = 180°W."""
     key = (res, str(path))
     if key not in _LAND:
         h, w = int(round(180 / res)), int(round(360 / res))
@@ -168,7 +168,7 @@ def land_raster(res=RES, path=LAND_FILE):
 
 
 # ----------------------------------------------------------------------------
-# Модель глобуса: орієнтація + перетворення пальця
+# Globe model: orientation + finger conversion
 # ----------------------------------------------------------------------------
 class GlobeModel:
     def __init__(self, geom, R0, theta=0.0):
@@ -178,7 +178,7 @@ class GlobeModel:
         return self.R0 @ rot_z(self.theta if theta is None else theta)
 
     def to_latlon(self, px, py):
-        """-> (lat, lon, ok, facing). ok=False, якщо палець поза кулею."""
+        """-> (lat, lon, ok, facing). ok=False if the finger is outside the sphere."""
         P, ok, facing = self.geom.hit(np.array([px]), np.array([py]))
         g = P @ self.R()                                        # = (R^T P^T)^T
         lat, lon = vec_to_latlon(g)
@@ -190,7 +190,7 @@ class GlobeModel:
 
 
 # ----------------------------------------------------------------------------
-# Відстеження кута обертання
+# Tracking the rotation angle
 # ----------------------------------------------------------------------------
 class SpinTracker:
     COARSE = np.arange(0, 360, 1.0)
@@ -207,7 +207,7 @@ class SpinTracker:
         self.px, self.py = X[inside].astype(int), Y[inside].astype(int)
         P, ok, facing = g.hit(self.px, self.py)
         self.px, self.py, P, facing = self.px[ok], self.py[ok], P[ok], facing[ok]
-        self.w = np.clip(facing, 0.2, 1.0)                     # біля краю кулі - менша вага
+        self.w = np.clip(facing, 0.2, 1.0)                     # near the edge of the sphere - lower weight
         self.P = P
         self.land = land_raster()
         self.nc = self.land.shape[1]
@@ -217,13 +217,13 @@ class SpinTracker:
         self.status, self.score, self.locked = "searching", 0.0, False
 
     def rebase(self, R0):
-        """Нова базова орієнтація (θ відраховується від неї); точки кадру ті самі."""
+        """New base orientation (θ is measured from it); the frame points stay the same."""
         self.base = np.asarray(R0, float).copy()
-        lat, lonq = vec_to_latlon(self.P @ self.base)          # координати в системі осі глобуса (θ = 0)
+        lat, lonq = vec_to_latlon(self.P @ self.base)          # coordinates in the globe-axis frame (θ = 0)
         self.lat_i = np.clip(((90 - lat) / RES).astype(int), 0, self.land.shape[0] - 1)
         self.lon_f = (lonq + 180) / RES
 
-    # --- модель кольору: P(вода | відтінок, насиченість) ---
+    # --- colour model: P(water | hue, saturation) ---
     def _hs(self, frame):
         pix = frame[self.py, self.px].reshape(-1, 1, 3)
         hsv = cv2.cvtColor(pix, cv2.COLOR_BGR2HSV).reshape(-1, 3)
@@ -240,13 +240,13 @@ class SpinTracker:
         self.hist_w = np.zeros((30, 32)); self.hist_l = np.zeros((30, 32))
         np.add.at(self.hist_w, (h[v & ~land], s[v & ~land]), 1)
         np.add.at(self.hist_l, (h[v & land], s[v & land]), 1)
-        k = cv2.getGaussianKernel(5, 1.0); k = k @ k.T             # згладити гістограми
+        k = cv2.getGaussianKernel(5, 1.0); k = k @ k.T             # smooth the histograms
         self.hist_w = cv2.filter2D(self.hist_w, -1, k, borderType=cv2.BORDER_REPLICATE)
         self.hist_l = cv2.filter2D(self.hist_l, -1, k, borderType=cv2.BORDER_REPLICATE)
 
     def water_prob(self, frame):
         h, s = self._hs(frame)
-        if self.hist_w is None:                                 # до калібрування: "синє = вода"
+        if self.hist_w is None:                                 # before calibration: "blue = water"
             return np.where((h >= 15) & (h <= 22) & (s >= 6), 0.85, 0.2)
         nw, nl = self.hist_w.sum() + 1e-9, self.hist_l.sum() + 1e-9
         pw, pl = self.hist_w[h, s] / nw + 1e-4, self.hist_l[h, s] / nl + 1e-4
@@ -265,7 +265,7 @@ class SpinTracker:
         valid = np.ones(len(self.px), bool)
         if hand_mask is not None:
             valid &= hand_mask[self.py, self.px] == 0
-        if valid.mean() < 0.35:                                 # рука закрила більшу частину глобуса
+        if valid.mean() < 0.35:                                 # the hand covers most of the globe
             self.status = "held" if self.locked else "searching"
             return self.model.theta
         pw = self.water_prob(frame)
@@ -275,26 +275,26 @@ class SpinTracker:
         scf = self.scores(pw, valid, fine)
         theta, best = float(fine[np.argmax(scf)] % 360), float(scf.max())
         far = np.abs(angdiff(self.COARSE, self.COARSE[b])) > 20
-        self.margin = best - float(sc[far].max())               # наскільки кращий за інші кути
+        self.margin = best - float(sc[far].max())               # how much better than other angles
         prev = self.model.theta
         if self.locked:
             at_prev = float(self.scores(pw, valid, [prev])[0])
             if abs(angdiff(theta, prev)) > 30 and best - at_prev < 0.03:
-                self.status = "held"                            # стрибок без певності - не віримо
+                self.status = "held"                            # a jump without confidence - do not trust it
                 return prev
             d = angdiff(theta, prev)
-            theta = (prev + 0.4 * d) % 360 if abs(d) < 1.0 else theta   # дрібне тремтіння згладжуємо
+            theta = (prev + 0.4 * d) % 360 if abs(d) < 1.0 else theta   # smooth small jitter
         self.model.theta, self.score, self.locked, self.status = theta, best, True, "tracked"
         return theta
 
 
 # ----------------------------------------------------------------------------
-# "Запам'ятати глобус": характерні точки поверхні з координатами на кулі -> повна позиція (PnP)
+# "Remember the globe": surface feature points with coordinates on the sphere -> full pose (PnP)
 # ----------------------------------------------------------------------------
 class GlobeMemory:
-    """Характерні точки (ORB) поверхні глобуса: для кожної - одиничний вектор на кулі (система глобуса)
-    і дескриптор. Поповнюється, коли глобус обертають (нові боки), зберігається у файл."""
-    MAX = 9000                                                  # більше - повільніше зіставлення
+    """Feature points (ORB) of the globe surface: for each, a unit vector on the sphere (globe coordinates)
+    and a descriptor. Grows when the globe is rotated (new sides), saved to a file."""
+    MAX = 9000                                                  # more = slower matching
 
     def __init__(self, g=None, d=None):
         self.g = np.zeros((0, 3), np.float32) if g is None else np.asarray(g, np.float32)
@@ -304,7 +304,7 @@ class GlobeMemory:
         return len(self.g)
 
     def add_from_frame(self, frame, model, orb, mask=None, min_facing=0.45, min_sep_deg=0.6, roi=None):
-        """Додати точки з кадру при відомій позиції model. -> скільки нових додано."""
+        """Add points from the frame with a known model pose. -> how many new points were added."""
         geom = model.geom
         m = np.zeros(frame.shape[:2], np.uint8)
         cv2.circle(m, (int(geom.u0), int(geom.v0)), int(geom.r * 0.97), 255, -1)
@@ -318,9 +318,9 @@ class GlobeMemory:
         keep = ok & (facing > min_facing)
         if not keep.any():
             return 0
-        g = (P[keep] @ model.R()).astype(np.float32)           # = R^T P: координати на кулі
+        g = (P[keep] @ model.R()).astype(np.float32)           # = R^T P: coordinates on the sphere
         des = des[keep]
-        if len(self.g):                                         # не дублювати вже відомі місця
+        if len(self.g):                                         # do not duplicate places already known
             near = (g @ self.g.T).max(1) > np.cos(np.radians(min_sep_deg))
             g, des = g[~near], des[~near]
         room = self.MAX - len(self.g)
@@ -342,10 +342,10 @@ class GlobeMemory:
 
 
 class GlobeTracker:
-    """Шукає запам'ятований глобус у кадрі: точки кадру <-> точки пам'яті -> PnP -> центр і орієнтація кулі.
-    Глобус можна переставляти, наближати, нахиляти. Якщо точок замало (невивчений бік, рука), -
-    запасний метод: пошук кута навколо осі за контурами суші (глобус на тому ж місці).
-    Під час впевненого відстеження пам'ять поповнюється новими боками глобуса."""
+    """Finds the remembered globe in the frame: frame points <-> memory points -> PnP -> sphere centre and orientation.
+    The globe can be moved, brought closer, tilted. If there are too few points (unlearned side, hand) -
+    fallback: search for the angle about the axis using land outlines (globe in the same place).
+    While tracking confidently, the memory is extended with new sides of the globe."""
     MIN_INLIERS = 14
 
     def __init__(self, model, memory=None, hist_w=None, hist_l=None):
@@ -359,7 +359,7 @@ class GlobeTracker:
         self.last_learn = -1e9
         self.frame_i = 0
 
-    # --- сумісність з рештою програми ---
+    # --- compatibility with the rest of the program ---
     @property
     def hist_w(self):
         return self.spin.hist_w
@@ -377,7 +377,7 @@ class GlobeTracker:
         return self.spin.py
 
     def learn_colors(self, frame, theta=0.0, valid=None, hand_mask=None):
-        self._ensure_spin()                                     # спершу точки під поточне положення кулі
+        self._ensure_spin()                                     # first, points for the current sphere position
         if hand_mask is not None:
             valid = hand_mask[self.spin.py, self.spin.px] == 0
         self.spin.learn_colors(frame, self.model.theta if theta is None else theta, valid)
@@ -387,8 +387,8 @@ class GlobeTracker:
         return (round(g.u0), round(g.v0), round(g.r))
 
     def _ensure_spin(self):
-        """SpinTracker прив'язаний до положення кулі в кадрі; після руху глобуса - перебудувати точки,
-        після зміни орієнтації - лише переобчислити базу (дешево)."""
+        """SpinTracker is tied to the sphere position in the frame; after the globe moves - rebuild the points,
+        after the orientation changes - just recompute the base (cheap)."""
         if self._key() != self._spin_key:
             self.spin = SpinTracker(self.model, hist_w=self.spin.hist_w, hist_l=self.spin.hist_l)
             self._spin_key = self._key()
@@ -396,8 +396,8 @@ class GlobeTracker:
             self.spin.rebase(self.model.R0)
 
     def _verify(self, frame, hand_mask, span=10.0):
-        """Перевірка позиції незалежним джерелом - контурами суші Natural Earth.
-        -> (збіг при поточній позиції, на скільки градусів навколо осі збіг був би кращим)."""
+        """Check the pose against an independent source - Natural Earth land outlines.
+        -> (agreement at the current pose, by how many degrees about the axis the agreement would be better)."""
         self.model.R0, self.model.theta = self.model.R(), 0.0
         self._ensure_spin()
         valid = np.ones(len(self.spin.px), bool)
@@ -410,7 +410,7 @@ class GlobeTracker:
         return float(sc[len(offs) // 2]), float(offs[int(np.argmax(sc))])
 
     def coverage(self):
-        """Яку частку глобуса вивчено: частка 10-градусних смуг довготи (між 60°S і 60°N), де є точки пам'яті."""
+        """How much of the globe is learned: share of 10-degree longitude bands (60°S..60°N) with memory points."""
         if not len(self.memory):
             return 0.0
         lat, lon = vec_to_latlon(self.memory.g)
@@ -418,8 +418,8 @@ class GlobeTracker:
         return float(len(np.unique(((lon + 180) // 10).astype(int))) / 36)
 
     def tour_step(self, frame, hand_mask=None, now=None, every=0.4):
-        """Калібрувальний "тур": глобус на місці, його повільно обертають. Кут - за сушею (точно),
-        з кожного положення запам'ятовуються точки. -> (кут, частка вивченого глобуса)."""
+        """Calibration "tour": the globe stays in place and is rotated slowly. Angle - from land (accurate),
+        points are remembered from every position. -> (angle, share of the globe learned)."""
         import time as _t
         now = _t.monotonic() if now is None else now
         self._ensure_spin()
@@ -435,11 +435,11 @@ class GlobeTracker:
             return False
         g = self.model.geom
         m = None
-        if self.locked:                                         # шукаємо біля останнього положення кулі
+        if self.locked:                                         # search near the last sphere position
             region = (g.u0, g.v0, g.r * 1.5)
-        else:                                                   # положення невідоме: спершу знайти кулю за обрисом,
+        else:                                                   # position unknown: first find the sphere by its outline,
             c = detect_globe_circle(frame) if self.frame_i % 3 == 1 or not hasattr(self, "_last_circle") else None
-            if c is not None:                                   # щоб точки фону не "з'їли" ліміт ORB
+            if c is not None:                                   # so that background points do not use up the ORB limit
                 self._last_circle = c
             c = getattr(self, "_last_circle", None)
             region = None if c is None else (c[0], c[1], c[2] * 1.15)
@@ -469,13 +469,13 @@ class GlobeTracker:
         C = tvec.ravel()
         if not ok or C[2] <= 1.05 or np.linalg.norm(C) <= 1.05:
             return False
-        P = obj[inl] @ R.T                                       # точки мають бути на видимому боці
+        P = obj[inl] @ R.T                                       # the points must be on the visible side
         if ((P * (C + P)).sum(1) >= 0).mean() > 0.1:
             return False
         proj, _ = cv2.projectPoints(obj[inl], rvec, tvec, K, None)
         if np.linalg.norm(proj.reshape(-1, 2) - img[inl], axis=1).mean() > 3.0:
             return False
-        if self.locked:                                          # дрібне тремтіння позиції згладжуємо
+        if self.locked:                                          # smooth small position jitter
             dC = np.linalg.norm(C - g.C)
             dA = np.degrees(np.arccos(np.clip((np.trace(R.T @ self.model.R()) - 1) / 2, -1, 1)))
             if dC < 0.01 and dA < 0.6:
@@ -492,20 +492,20 @@ class GlobeTracker:
         if self._pnp(frame, hand_mask):
             self.status, self.mode, self.locked = "tracked", "features", True
             if now - self.last_learn > 1.0 and self.inliers >= 25:
-                # дозапам'ятовуємо лише позицію, яку підтверджують контури суші (інакше похибка накопичується)
+                # remember only a pose confirmed by land outlines (otherwise the error accumulates)
                 self.land_score, off = self._verify(frame, hand_mask)
                 if self.land_score > 0.88 and abs(off) <= 0.5:
                     self.memory.add_from_frame(frame, self.model, self.orb, hand_mask, min_facing=0.6)
                 self.last_learn = now
             return self.model.theta
-        # запасний метод: глобус на тому ж місці, шукаємо лише кут навколо осі за контурами суші
+        # fallback: globe in the same place, search only the angle about the axis using land outlines
         self._ensure_spin()
         self.spin.update(frame, hand_mask)
         good = self.spin.status == "tracked" and self.spin.score > 0.85 and getattr(self.spin, "margin", 0) > 0.05
         self.inliers, self.score = 0, self.spin.score
         if good:
             self.status, self.mode, self.locked = "tracked", "spin", True
-            if now - self.last_learn > 0.5:                    # невивчений бік: запам'ятовуємо його
+            if now - self.last_learn > 0.5:                    # unlearned side: remember it
                 self.memory.add_from_frame(frame, self.model, self.orb, hand_mask, min_facing=0.6)
                 self.last_learn = now
         else:
@@ -514,18 +514,18 @@ class GlobeTracker:
 
 
 # ----------------------------------------------------------------------------
-# Віртуальний глобус: малюється поверх камери, обертається щипком лівої руки
+# Virtual globe: drawn over the camera picture, rotated with a left-hand pinch
 # ----------------------------------------------------------------------------
 def _rodrigues(axis_angle):
     return cv2.Rodrigues(np.asarray(axis_angle, np.float64).reshape(3, 1))[0]
 
 
 class VirtualGlobe:
-    """Глобус, якого немає фізично: куля з даними шару малюється поверх (дзеркального) кадру камери.
-    Права рука показує на нього, ліва обертає: щипок (великий + вказівний) і рух = трекбол, з інерцією.
-    Система огляду: X праворуч, U вгору, Z до глядача; v = R g (g - точка в системі глобуса)."""
+    """A globe that does not physically exist: a sphere with the layer data is drawn over the (mirrored) camera frame.
+    The right hand points at it, the left hand rotates it: pinch (thumb + index) and move = trackball, with inertia.
+    View coordinates: X right, U up, Z towards the viewer; v = R g (g - point in globe coordinates)."""
     status, mode, inliers, score = "tracked", "virtual", 0, 1.0
-    PINCH_ON, PINCH_OFF = 0.33, 0.5          # відстань великий-вказівний / розмір долоні
+    PINCH_ON, PINCH_OFF = 0.33, 0.5          # thumb-index distance / palm size
 
     def __init__(self, frame_wh, radius_frac=0.42, lat0=20.0, lon0=15.0, step=2):
         self.W, self.H = int(frame_wh[0]), int(frame_wh[1])
@@ -544,12 +544,12 @@ class VirtualGlobe:
             grat.append(latlon_to_vec(np.full_like(lo, la), lo))
         self.grat = grat
         self.pinching, self.last_pt, self.pinch_pt, self.last_t = False, None, None, None
-        self.vel = np.zeros(2)                                   # швидкість перетягування (px/с) для інерції
+        self.vel = np.zeros(2)                                   # drag speed (px/s) for inertia
         self._grid = None
 
-    # --- орієнтація ---
+    # --- orientation ---
     def reset(self, lat0=20.0, lon0=15.0):
-        """Точка (lat0, lon0) у центрі, північ угору."""
+        """Point (lat0, lon0) in the centre, north up."""
         fwd = latlon_to_vec(lat0, lon0)
         north = np.array([0, 0, 1.0])
         up = north - fwd * (north @ fwd); up /= np.linalg.norm(up)
@@ -557,12 +557,12 @@ class VirtualGlobe:
         self.vel = np.zeros(2)
 
     def north_up(self):
-        """Повернути північ угору, не змінюючи місця в центрі."""
+        """Turn north up without changing the place in the centre."""
         lat, lon, _, _ = self.to_latlon(self.u0, self.v0)
         self.reset(lat, lon)
 
     def rotate_drag(self, dx, dy):
-        """Перетягування на (dx, dy) пікселів: поверхня рухається за рукою (трекбол)."""
+        """Drag by (dx, dy) pixels: the surface follows the hand (trackball)."""
         d = np.array([dx, -dy], float) / self.r
         ang = float(np.linalg.norm(d))
         if ang < 1e-6:
@@ -574,7 +574,7 @@ class VirtualGlobe:
         self.r = float(np.clip(self.r * factor, self.H * 0.2, self.H * 0.49))
         self._grid = None
 
-    # --- палець -> координати ---
+    # --- finger -> coordinates ---
     def to_latlon(self, px, py):
         X, U = (px - self.u0) / self.r, (self.v0 - py) / self.r
         d2 = X * X + U * U
@@ -588,7 +588,7 @@ class VirtualGlobe:
         V = np.asarray(G) @ self.R.T
         return self.u0 + V[:, 0] * self.r, self.v0 - V[:, 1] * self.r, V[:, 2] > 0
 
-    # --- ліва рука: щипок і рух ---
+    # --- left hand: pinch and move ---
     def handle_left(self, lms, w, h, now):
         dt = 0.0 if self.last_t is None else min(now - self.last_t, 0.2)
         self.last_t = now
@@ -596,7 +596,7 @@ class VirtualGlobe:
             self.pinching, self.last_pt, self.pinch_pt = False, None, None
         else:
             p = lambda i: np.array([lms[i].x * w, lms[i].y * h])
-            size = max(np.linalg.norm(p(0) - p(9)), 1.0)        # зап'ястя - основа середнього пальця
+            size = max(np.linalg.norm(p(0) - p(9)), 1.0)        # wrist - base of the middle finger
             pd = np.linalg.norm(p(4) - p(8)) / size
             self.pinching = pd < (self.PINCH_OFF if self.pinching else self.PINCH_ON)
             self.pinch_pt = (p(4) + p(8)) / 2
@@ -609,13 +609,13 @@ class VirtualGlobe:
                 self.last_pt = self.pinch_pt
                 return
             self.last_pt = None
-        if dt > 0 and np.linalg.norm(self.vel) > 20:             # інерція після відпускання
+        if dt > 0 and np.linalg.norm(self.vel) > 20:             # inertia after letting go
             self.rotate_drag(*(self.vel * dt))
             self.vel *= np.exp(-dt / 0.6)
         elif dt > 0:
             self.vel[:] = 0
 
-    # --- малювання ---
+    # --- drawing ---
     def _disc(self):
         if self._grid is None:
             s = self.step
@@ -629,7 +629,7 @@ class VirtualGlobe:
 
     def draw(self, frame, layer=None, t=None, alpha=0.6):
         V, inside, Z, n = self._disc()
-        G = V[inside] @ self.R                                   # точки диска -> координати на глобусі
+        G = V[inside] @ self.R                                   # disc points -> coordinates on the globe
         lat, lon = vec_to_latlon(G)
         img = np.zeros((n, n, 3), np.uint8)
         if layer is not None:
@@ -646,7 +646,7 @@ class VirtualGlobe:
             li = np.clip(((90 - lat) / RES).astype(int), 0, land.shape[0] - 1)
             lj = np.clip(((lon + 180) / RES).astype(int), 0, land.shape[1] - 1)
             rgb = np.where(land[li, lj][:, None], [[150, 170, 110]], [[60, 120, 185]]).astype(float)
-        rgb *= (0.55 + 0.45 * Z[inside])[:, None]                # об'єм: край кулі темніший
+        rgb *= (0.55 + 0.45 * Z[inside])[:, None]                # volume: the edge of the sphere is darker
         img[inside] = np.clip(rgb[:, ::-1], 0, 255).astype(np.uint8)   # RGB -> BGR
         big = cv2.resize(img, (2 * int(self.r), 2 * int(self.r)), interpolation=cv2.INTER_LINEAR)
         mask = np.zeros(big.shape[:2], np.uint8)
@@ -672,7 +672,7 @@ class VirtualGlobe:
                             cv2.polylines(frame, [np.int32(pts[start:k])], False, col, th, cv2.LINE_AA)
                         start = None
         cv2.circle(frame, (int(self.u0), int(self.v0)), int(self.r), (255, 255, 255), 2, cv2.LINE_AA)
-        if self.pinch_pt is not None:                            # де ліва рука: щипок = обертання
+        if self.pinch_pt is not None:                            # where the left hand is: pinch = rotate
             c = tuple(int(v) for v in self.pinch_pt)
             col = (191, 106, 37) if self.pinching else (160, 160, 160)
             cv2.circle(frame, c, 14 if self.pinching else 9, col, -1 if self.pinching else 2, cv2.LINE_AA)
@@ -681,10 +681,10 @@ class VirtualGlobe:
 
 
 # ----------------------------------------------------------------------------
-# Пошук обрису кулі в кадрі
+# Finding the sphere outline in the frame
 # ----------------------------------------------------------------------------
 def detect_globe_circle(frame):
-    """-> (u0, v0, r) найбільшого чіткого кола або None."""
+    """-> (u0, v0, r) of the largest clear circle, or None."""
     h, w = frame.shape[:2]
     s = min(1.0, 640.0 / max(h, w))
     small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else frame
@@ -709,7 +709,7 @@ def circle_from_3pts(p1, p2, p3):
 
 
 # ----------------------------------------------------------------------------
-# Накладання на кадр: обрис, сітка, берегові лінії (видно, чи збіглося)
+# Overlay on the frame: outline, grid, coastlines (shows whether the tracking matches)
 # ----------------------------------------------------------------------------
 class GlobeOverlay:
     def __init__(self, model, coast_step=4):
@@ -730,7 +730,7 @@ class GlobeOverlay:
             x, y, vis = self.model.geom.project(V @ R.T)
             pts = np.stack([x, y], 1)
             start = None
-            for i in range(len(vis) + 1):                      # малюємо лише видимі шматки
+            for i in range(len(vis) + 1):                      # draw only the visible pieces
                 if i < len(vis) and vis[i]:
                     start = i if start is None else start
                 elif start is not None:
@@ -747,7 +747,7 @@ class GlobeOverlay:
 
 
 # ----------------------------------------------------------------------------
-# Збереження калібрування
+# Saving the calibration
 # ----------------------------------------------------------------------------
 GLOBE_MEMORY = HERE / "globe_memory.npz"
 
@@ -764,7 +764,7 @@ def save_globe(path, model, tracker, extra=None):
 
 
 def load_globe(path=GLOBE_CALIB):
-    """-> (model, GlobeTracker) з останнім відомим положенням і пам'яттю точок, або None."""
+    """-> (model, GlobeTracker) with the last known pose and the point memory, or None."""
     p = Path(path)
     if not p.exists():
         return None
@@ -779,16 +779,16 @@ def load_globe(path=GLOBE_CALIB):
 
 
 # ----------------------------------------------------------------------------
-# Синтетичний глобус для самотесту (рендер "кадру камери")
+# Synthetic globe for the self-test (renders a "camera frame")
 # ----------------------------------------------------------------------------
 def synthetic_texture(width=2048, seed=3):
-    """Схожа на політичний глобус текстура (рівнокутна): країни різних кольорів, кордони, сітка, написи."""
+    """Texture that looks like a political globe (equirectangular): coloured countries, borders, grid, labels."""
     rng = np.random.default_rng(seed)
     h = width // 2
     sx, sy = width / 360.0, h / 180.0
     tex = np.zeros((h, width, 3), np.uint8)
-    tex[:] = (185, 125, 40)                                      # океан (BGR)
-    for y in range(0, h, 4):                                     # легкий градієнт глибини
+    tex[:] = (185, 125, 40)                                      # ocean (BGR)
+    for y in range(0, h, 4):                                     # slight depth gradient
         tex[y:y + 4] = np.clip(np.array((185, 125, 40)) - abs(y - h / 2) / h * 40, 0, 255)
     cfile = HERE / "data" / "ne_50m_admin_0_countries.geojson"
     polys = []
@@ -827,13 +827,13 @@ def render_synthetic(geom, R, frame_shape, seed=0, water=(185, 120, 35), texture
     li = np.clip(((90 - lat) / RES).astype(int), 0, land.shape[0] - 1)
     lj = np.clip(((lon + 180) / RES).astype(int), 0, land.shape[1] - 1)
     is_land = land[li, lj]
-    if texture is not None:                                    # текстура глобуса (рівнокутна)
+    if texture is not None:                                    # globe texture (equirectangular)
         th_, tw_ = texture.shape[:2]
         ti = np.clip(((90 - lat) / 180 * th_).astype(int), 0, th_ - 1)
         tj = np.clip(((lon + 180) / 360 * tw_).astype(int), 0, tw_ - 1)
         col = texture[ti, tj].astype(float)
     else:
-        band = np.abs(lat)                                    # суша: зелена біля екватора, жовто-бура далі
+        band = np.abs(lat)                                    # land: green near the equator, yellow-brown further away
         land_col = np.stack([60 + band, 150 - band * 0.6, 120 + band * 1.2], 1)
         col = np.where(is_land[:, None], land_col, np.array(water, float)[None, :])
     shade = 0.55 + 0.45 * np.clip(facing, 0, 1)

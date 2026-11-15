@@ -4,40 +4,43 @@ venv/
 __pycache__/
 *.pyc
 
-# --- macOS / редактори ---
+# --- macOS / editors ---
 .DS_Store
 .vscode/
 .idea/
 
-# --- локальні налаштування Claude Code ---
+# --- local Claude Code settings ---
 .claude/settings.local.json
 
-# --- калібрування камери: залежить від того, де стоїть камера і лежить карта ---
+# --- camera calibration: depends on where the camera and the map are ---
 calibration.json
 calibration_template.png
 globe_calibration.json
 globe_memory.npz
 
-# --- великі дані, завантажуються окремо (див. команди нижче) ---
-# NOAA ERSST v5, ~160 МБ (GitHub не приймає файли > 100 МБ):
+# --- large data, downloaded separately (see the commands below) ---
+# NOAA ERSST v5, ~160 MB (GitHub does not accept files > 100 MB):
 #   curl -L -o sst.mnmean.nc https://downloads.psl.noaa.gov/Datasets/noaa.ersst.v5/sst.mnmean.nc
 *.nc
 *.nc.gz
 
-# Модель MediaPipe для трекінгу руки, ~7.5 МБ:
+# MediaPipe hand-tracking model, ~7.5 MB:
 #   mkdir -p models && curl -L -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 models/
 
-# Контури суші Natural Earth, ~1.6 МБ:
+# Natural Earth land outlines, ~1.6 MB:
 #   mkdir -p data && curl -L -o data/ne_50m_land.geojson https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson
 data/
 
-# --- результати самотесту finger_map.py --selftest ---
+# --- output of finger_map.py --selftest ---
 selftest_out/
 
-# --- відео/аудіо/кадри, які згенеруємо пізніше ---
+# --- video/audio/frames generated later ---
 frames/
 *.mp4
 *.mov
 *.wav
 *.aiff
+
+# --- voice samples ---
+voice_samples/
