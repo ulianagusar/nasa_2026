@@ -48,3 +48,4 @@ voice_samples/
 
 # --- spoken sentences already made by the Kokoro voice ---
 .tts_cache/
+.removed_layers/

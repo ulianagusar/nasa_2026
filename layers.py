@@ -66,6 +66,15 @@ BUILTIN = {
         "speech_note": "The faster the current, the rougher the water sounds.",
         "sound": "water", "sound_dir": "data/currents_sounds",
     },
+    "earthquakes_maxmag": {
+        "title": "Strongest earthquake of the week",
+        "units": "magnitude", "fmt": "{:.1f}", "cmap": ["#fdeee4", "#f6b48f", "#eb6834", "#b7461c", "#6e2509"],
+        "default_frame": 0, "missing_label": "no earthquakes",
+        "note": "strongest earthquake (M 4.5+) in a 2° cell during the week", "source": "USGS Earthquake Catalog",
+        "speech_note": "This is the strongest earthquake of that week near this place.",
+        # felt on the trackpad: quakes within 500 km count, weaker with distance (most cells are empty)
+        "haptic": {"radius_km": 500, "min": 0.2},
+    },
     "ocean_flow_activity": {
         "title": "Ocean current activity from NASA video (0–1)",
         "units": "", "fmt": "{:.2f}", "cmap": "blues", "default_frame": 0,
@@ -77,7 +86,7 @@ BUILTIN = {
 }
 CFG_KEYS = ("title", "units", "source", "description", "note", "fmt", "vmin", "vmax", "cmap", "baseline",
             "base_label", "tension_scale", "default_year", "default_frame", "missing_label", "static_label",
-            "partial_years", "prefer", "speech_note", "max_near_km", "sound", "sound_dir", "scale")
+            "partial_years", "prefer", "speech_note", "max_near_km", "sound", "sound_dir", "scale", "haptic")
 
 
 def wrap180(lon):

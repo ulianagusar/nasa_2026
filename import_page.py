@@ -361,7 +361,9 @@ class CheckPage:
         region = "whole world" if list(map(float, r)) == M.WORLD else f"lon {r[0]:g}…{r[1]:g}, lat {r[2]:g}…{r[3]:g}"
         return [("Name", s["name"]), ("Title", s["title"]), ("Units", s["units"] or "(none)"),
                 ("Source", s["source"] or "(none)"), ("Scale", s["scale"]), ("Range", rng),
-                ("Dates", dates), ("Steps", steps), ("Region", region), ("Keep", s["keep"])]
+                ("Dates", dates), ("Steps", steps), ("Region", region),
+                ("Keep", {"all": "everything", "ocean": "only ocean (land cut out)",
+                          "land": "only land (ocean cut out)"}[s["keep"]])]
 
     def fields_rects(self):
         out = []

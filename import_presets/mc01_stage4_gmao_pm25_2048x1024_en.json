@@ -4,7 +4,7 @@
   "source": "",
   "palette": {
     "kind": "image",
-    "image": "/Users/ulanagusar/Desktop/nasa/import_presets/mc01_stage4_gmao_pm25_2048x1024_en_scale.png",
+    "image": "import_presets/mc01_stage4_gmao_pm25_2048x1024_en_scale.png",
     "box": [
       71,
       42,

@@ -44,6 +44,7 @@ import numpy as np
 import layers as L
 import speech as SP
 import globe as GB
+import haptics as HP
 import virtual_map as VM
 
 HERE = Path(__file__).resolve().parent
@@ -66,6 +67,7 @@ KEYS = [
     ("p", "the P key", "play through time; press again to pause"),
     ("r", "the R key", "repeat the last message"),
     ("m", "the M key", "sound on or off"),
+    ("j", "the J key", "trackpad vibration on or off, for maps you can feel"),
     ("v", "the V key", "spoken messages on or off; the sounds stay"),
     ("h", "the H key", "swap hands if the program mixes them up"),
     ("c", "the C key", "recalibrate the map"),
@@ -1298,6 +1300,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     zooming = False
     finger, time_finger = OneEuro(), OneEuro(min_cutoff=0.8)
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
+    hap = HP.Haptics(enabled=not args.no_haptics)             # trackpad shaking for layers with "haptic"
     geo = SP.Geocoder()                                         # countries / seas / regions with English names
     voice = SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate)
     last_spoken = ""
@@ -1505,6 +1508,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 
         # ---- sound ----
         sonify(son, layer, s, lon)
+        hap.set(HP.level_at(layer, lat, lon, t, s) if lat is not None else 0.0)   # felt on the trackpad
         info["note"] = None if son.note is None else f"{midi_name(son.note)} · {midi_to_hz(son.note):.0f} Hz"
         info["muted"] = son.muted or son.stream is None
 
@@ -1545,6 +1549,11 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             break
         if key == ord("m"):
             print("Sound off" if son.toggle_mute() else "Sound on")
+        if key == ord("j"):
+            on = hap.toggle()
+            args.no_haptics = not on
+            print("Trackpad vibration " + ("on" if on else "off"))
+            voice.speak("Vibration on." if on else "Vibration off.")
         if key == ord("v"):
             voice = toggle_voice(voice, args)
         if key == ord("r") and last_spoken and voice.enabled:
@@ -1615,6 +1624,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             tracker.locked = True
     voice.stop()                                               # the menu announces itself
     son.close()
+    hap.close()
     landmarker.close()
     if globe is not None and not drawn:
         GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)       # last pose + newly remembered sides
@@ -2803,6 +2813,8 @@ def main():
                     help="how to track the map: features - by the map picture (default), "
                          "contour - by the sheet edges, static - the map does not move")
     ap.add_argument("--no-sound", action="store_true", help="no sonification")
+    ap.add_argument("--no-haptics", action="store_true",
+                    help="no trackpad vibration (layers with \"haptic\", e.g. earthquakes; the j key toggles it)")
     ap.add_argument("--no-voice", action="store_true", help="do not announce the point by voice")
     ap.add_argument("--voice", default="auto",
                     help="voice (default: auto = the neural Kokoro voice af_heart if its model is in models/ - "

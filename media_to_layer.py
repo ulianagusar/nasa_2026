@@ -730,7 +730,7 @@ class Importer:
         kind = p.get("kind", "frame")
         self.bar_box = self.bar_image = None
         if kind in ("frame", "image"):
-            img = self.samples[0] if kind == "frame" else _read_rgb(p["image"])
+            img = self.samples[0] if kind == "frame" else _read_rgb(project_path(p["image"]))
             box = p.get("box")
             if redetect or not self._box_ok(box, img):
                 box = find_colour_bar(img)
@@ -946,6 +946,17 @@ def _jsonable(o):
     return o
 
 
+def project_path(p):
+    """A path from a preset: relative ones are inside the project folder; an old absolute path that pointed into
+    import_presets/ of a moved project is found there too."""
+    p = Path(p)
+    if not p.is_absolute():
+        return HERE / p
+    if not p.exists() and p.parent.name == PRESET_DIR.name and (PRESET_DIR / p.name).exists():
+        return PRESET_DIR / p.name
+    return p
+
+
 def _read_rgb(path):
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
@@ -970,7 +981,7 @@ def save_preset(imp, name=None):
         dst = PRESET_DIR / f"{name}_scale{src.suffix.lower()}"
         if src.exists() and src.resolve() != dst.resolve():
             shutil.copyfile(src, dst)
-        pal["image"] = str(dst)
+        pal["image"] = dst.relative_to(HERE).as_posix()            # relative: the project can be moved
     (PRESET_DIR / f"{name}.json").write_text(json.dumps(p, ensure_ascii=False, indent=2))
     return name
 

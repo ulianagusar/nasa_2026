@@ -17,11 +17,9 @@ position along the map); on the globe surfaces the time is set with the keys.
 |---|---|---|---|
 | `sst` | map, 1 moment | Sea surface temperature, the latest month + the 1971–2000 normal | `sst.mnmean.nc` (NOAA ERSST v5) |
 | `temperature` | 147 frames, years 1880–2026 | Land and ocean temperature anomaly vs 1951–1980 | `data/temperature/` (NASA GISTEMP v4) |
-| `ocean_sst_video` | 48 frames, weeks 03.2007–02.2008 | Ocean temperature decoded from the colours of a video (ECCO2 model). The "normal" is the yearly mean of each cell | `data/ocean_sst_video/` (NASA SVS 3912) |
-| `ocean_flow_activity` | 48 frames, weeks 03.2007–02.2008 | Share of drawn current lines in a cell (0–1) - a visual index, not a speed | `data/ocean_flow_activity/` (NASA SVS 3912) |
 | `currents_speed` | 8 frames, months 01–08.2014 | Ocean surface current speed, m/s, monthly mean. **Heard as water** (calm river → roaring sea) instead of a note | `data/currents_speed/` (OSCAR, NASA PO.DAAC via NOAA ERDDAP) |
 
-Time in a layer is a sequence of **frames**: years (`temperature`) or dates (`ocean_*`). The left finger
+Time in a layer is a sequence of **frames**: years (`temperature`) or dates (`currents_speed`). The left finger
 goes through all frames from the left to the right edge of the map. When the layer is switched, the
 program picks the frame closest to the same moment in time.
 
@@ -145,6 +143,7 @@ Overrides any value from the metadata. All keys are optional:
 | `max_near_km` | If a point has no data, use the nearest cell only within this distance (default 300 km) |
 | `sound` | A sound set instead of a note: `"water"` or the name of a set in `data/sounds/` (see below); `"note"` - notes (also overrides a built-in set) |
 | `sound_dir` | Folder with the water recordings and their `sounds.json` (default `data/currents_sounds`) |
+| `haptic` | Felt on the MacBook trackpad: `true` (the value under the finger) or `{"radius_km": 500, "min": 0.2}` (events near the finger count too, weaker with distance) - see "Feeling a map" below |
 | `scale` | `"log"` - colours and note pitch follow the logarithm of the value (for values over several orders of magnitude). Set automatically by the importer |
 
 ## What the voice says
@@ -217,6 +216,22 @@ values a little louder, like the water; default) or `equal` (L on the page). The
 Mixing: every recording has a `center` on the 0..1 scale (evenly spread by default; can be changed in
 `sounds.json`); between two neighbouring centers the two recordings crossfade with constant power
 (`gain = sqrt(share)`). With one recording only, its volume follows the value (0.2 → 1).
+
+### Feeling a map: trackpad vibration (`"haptic"`)
+
+A MacBook has no vibration motor, but its Force Touch trackpad has a haptic actuator. [haptics.py](haptics.py) makes
+it tick: a train of ticks is felt as shaking under a hand resting on the trackpad (e.g. the left palm while the
+right index finger points at the map). Stronger value → more ticks per second (4 → 22), stronger ticks
+(weak / medium / strong) and an irregular rhythm; above 0.85 come double jolts.
+
+Used by `earthquakes_maxmag` (`"haptic": {"radius_km": 500, "min": 0.2}`): 99.5% of its cells are empty, so a
+finger rarely hits a quake exactly; every quake within 500 km counts, weaker with distance (`(1 - d/500)^1.5`),
+so the shaking grows as the finger comes closer. M 8.8 under the finger = 1.0, 250 km away ≈ 0.35, beyond
+500 km nothing; the weakest quake on the scale (M 4.5) is felt at 0.2.
+
+The `j` key turns the vibration off and on; `--no-haptics` starts without it. Try it (hand on the trackpad):
+`.venv/bin/python haptics.py` - 6 s from nothing to the strongest shaking. The actuator is a private macOS
+interface (MultitouchSupport.framework); if it is missing, the program runs without vibration.
 
 ## Useful
 
