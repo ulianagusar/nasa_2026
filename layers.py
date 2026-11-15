@@ -397,6 +397,7 @@ def load_sst_layer(path=SST_FILE, month=None):
            "fmt": "{:.1f}", "vmin": -2.0, "vmax": 32.0, "cmap": "sequential",
            "base_label": "the 1971–2000 normal", "tension_scale": 2.5, "missing_label": "land",
            "static_label": f"{MONTHS_EN[m - 1]} {date[:4]}"}
+    cfg.update(_folder_overrides(DATA_DIR / "sst"))            # e.g. a sound set chosen for this layer
     return GridLayer("sst", cfg, lat, lon, cur[None], baseline_grid=base)
 
 

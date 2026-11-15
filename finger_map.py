@@ -878,59 +878,108 @@ def midi_name(m):
     return f"{NOTE_NAMES[m % 12]}{m // 12 - 1}"
 
 
-class WaterBank:
-    """Looped water recordings for layers with "sound": "water" (e.g. ocean currents).
-    sounds.json lists the files from the calmest to the roughest; all loops play at the same time and only
-    their volumes change with the value: s = 0..1, p = s * (N - 1), gain_i = sqrt(max(0, 1 - |p - i|)) -
-    the total power stays constant, so there are no volume dips between neighbouring sounds.
-    The mp3 files are decoded once with macOS `afconvert` into <sound_dir>/.decoded/*.wav."""
+class SoundBank:
+    """Looped recordings for layers with a sound set ("sound": "water" or any set made with sound_pack.py).
+    sounds.json lists the recordings from the lowest to the highest values, each with its "center" (0..1 on the
+    layer scale). All loops play at the same time and only their volumes change with the value: between two
+    neighbouring centers the two recordings crossfade with constant power (gain = sqrt of the share), so there
+    are no volume dips. One recording only: its volume follows the value.
+    Files are decoded once with macOS `afconvert` into <sound_dir>/.decoded/*.wav (WAV files are read directly)."""
 
-    def __init__(self, sound_dir):
+    def __init__(self, sound_dir=None, loops=None, centers=None, names=None):
+        if loops is not None:                                   # ready arrays (preview before saving)
+            self.loops = [np.asarray(x, np.float32) for x in loops]
+            n = len(self.loops)
+            self.centers = np.asarray(centers if centers is not None else np.linspace(0, 1, n) if n > 1 else [0.5], float)
+            self.names = list(names or [f"sound {k + 1}" for k in range(n)])
+            self.pos = np.zeros(n, np.int64)
+            return
         import subprocess
         import wave
         sound_dir = Path(sound_dir)
         meta = json.loads((sound_dir / "sounds.json").read_text())
         levels = sorted(meta["levels"], key=lambda l: l.get("center", 0))
         cache = sound_dir / ".decoded"
-        cache.mkdir(exist_ok=True)
         loops = []
         for lv in levels:
             src = sound_dir / lv["file"]
-            wav = cache / (src.stem + ".wav")
-            if not wav.exists() or wav.stat().st_mtime < src.stat().st_mtime:
-                subprocess.run(["afconvert", "-f", "WAVE", "-d", f"LEI16@{Sonifier.SR}", str(src), str(wav)],
-                               check=True, capture_output=True)
+            wav = src
+            if src.suffix.lower() != ".wav":
+                cache.mkdir(exist_ok=True)
+                wav = cache / (src.stem + ".wav")
+                if not wav.exists() or wav.stat().st_mtime < src.stat().st_mtime:
+                    subprocess.run(["afconvert", "-f", "WAVE", "-d", f"LEI16@{Sonifier.SR}", str(src), str(wav)],
+                                   check=True, capture_output=True)
             with wave.open(str(wav)) as w:
                 x = np.frombuffer(w.readframes(w.getnframes()), "<i2").reshape(-1, w.getnchannels())
-            x = x.astype(np.float32) / 32768.0
+            x = x.astype(np.float32) / 32768.0 * float(lv.get("gain", 1.0))
             loops.append(x if x.shape[1] == 2 else np.repeat(x[:, :1], 2, 1))
-        n = min(len(x) for x in loops)
-        self.loops = np.stack([x[:n] for x in loops])          # (sounds, frames, 2)
-        self.names = [lv["name"] for lv in levels]
-        self.pos = 0
+        self.loops = loops
+        n = len(loops)
+        self.centers = np.array([float(lv.get("center", k / max(n - 1, 1))) for k, lv in enumerate(levels)])
+        self.names = [lv.get("name", lv["file"]) for lv in levels]
+        self.pos = np.zeros(n, np.int64)                        # every loop keeps its own place (lengths differ)
+
+    def __len__(self):
+        return len(self.loops)
 
     @staticmethod
     def gains(s, n_sounds):
+        """Evenly spaced sounds: p = s * (N - 1), gain_i = sqrt(max(0, 1 - |p - i|))."""
         p = float(np.clip(s, 0, 1)) * (n_sounds - 1)
         return np.sqrt(np.maximum(0.0, 1.0 - np.abs(p - np.arange(n_sounds))))
 
+    def mix_gains(self, s):
+        """Gains for the value s (0..1) using the centers of the recordings."""
+        s = float(np.clip(s, 0, 1))
+        n = len(self.loops)
+        if n == 1:
+            return np.array([0.2 + 0.8 * s])                     # one recording: louder for higher values
+        c = self.centers
+        g = np.zeros(n)
+        if s <= c[0]:
+            g[0] = 1.0
+        elif s >= c[-1]:
+            g[-1] = 1.0
+        else:
+            k = int(np.searchsorted(c, s) - 1)
+            f = (s - c[k]) / max(c[k + 1] - c[k], 1e-9)
+            g[k], g[k + 1] = np.sqrt(1 - f), np.sqrt(f)
+        return g
+
     def block(self, n):
         """Next n frames of every loop: (sounds, n, 2), wrapping around seamlessly."""
-        idx = (self.pos + np.arange(n)) % self.loops.shape[1]
-        self.pos = (self.pos + n) % self.loops.shape[1]
-        return self.loops[:, idx]
+        out = np.empty((len(self.loops), n, 2), np.float32)
+        for k, x in enumerate(self.loops):
+            idx = (self.pos[k] + np.arange(n)) % len(x)
+            self.pos[k] = (self.pos[k] + n) % len(x)
+            out[k] = x[idx]
+        return out
+
+
+WaterBank = SoundBank          # the old name (water was the first sound set)
+
+
+def sound_dir_of(layer):
+    """Folder of the sound set of a layer, or None for notes. "sound": "water" -> data/currents_sounds,
+    "sound": "<set>" -> data/sounds/<set>, unless "sound_dir" says otherwise; "sound": "note" -> notes."""
+    snd = layer.cfg.get("sound")
+    if not snd or snd == "note":
+        return None
+    d = layer.cfg.get("sound_dir") or ("data/currents_sounds" if snd == "water" else f"data/sounds/{snd}")
+    return HERE / d
 
 
 _WATER_CACHE = {}
 
 
 def sonify(son, layer, s, lon):
-    """The sound for the value under the finger: water for layers with "sound": "water", otherwise a note."""
+    """The sound for the value under the finger: the layer's recordings if it has a sound set, otherwise a note."""
     if s is None:
         son.silence()
     elif s["missing"]:
         son.missing(lon)
-    elif layer.cfg.get("sound") == "water" and son.load_water(HERE / layer.cfg.get("sound_dir", "data/currents_sounds")):
+    elif sound_dir_of(layer) is not None and son.load_water(sound_dir_of(layer)):
         son.play_water(s["norm"], lon, quiet=bool(s["near_km"]))
     else:
         son.play(s["norm"], s["tension"], lon, quiet=bool(s["near_km"]))
@@ -943,7 +992,7 @@ class Sonifier:
                                beating (second voice detuned) and a pulsing "heartbeat" when above;
       longitude             -> stereo panorama (west on the left, east on the right);
       no data               -> soft noise; announcement -> chime.
-    Layers with "sound": "water" are heard as a mix of looped water recordings instead (WaterBank).
+    Layers with a sound set ("sound": "water" or any set) are heard as a mix of looped recordings instead (SoundBank).
     All changes are smooth (portamento/smoothing), so there are no clicks.
     render() also works without a sound card (for writing WAV files and tests)."""
     SR = 44100
@@ -1002,27 +1051,33 @@ class Sonifier:
     WATER_TAU = 0.15
 
     def load_water(self, sound_dir):
-        """Load (once, cached) the water loops of sound_dir. -> True if available."""
+        """Load (once, cached) the loops of a sound set folder. -> True if available."""
         key = str(sound_dir)
-        if key not in _WATER_CACHE:
+        stamp = (Path(sound_dir) / "sounds.json").stat().st_mtime if (Path(sound_dir) / "sounds.json").exists() else None
+        if key not in _WATER_CACHE or _WATER_CACHE[key][0] != stamp:     # a set saved again -> read it again
             try:
-                _WATER_CACHE[key] = WaterBank(sound_dir)
+                _WATER_CACHE[key] = (stamp, SoundBank(sound_dir))
             except Exception as e:
-                print(f"  Water sounds not available ({e}); using notes instead.")
-                _WATER_CACHE[key] = None
-        bank = _WATER_CACHE[key]
-        if bank is not None and self.water is not bank:
+                print(f"  Sounds of {Path(sound_dir).name} not available ({e}); using notes instead.")
+                _WATER_CACHE[key] = (stamp, None)
+        bank = _WATER_CACHE[key][1]
+        if bank is not None:
+            self.use_bank(bank)
+        return bank is not None
+
+    def use_bank(self, bank):
+        """Play this SoundBank from now on (e.g. a preview before saving)."""
+        if self.water is not bank:
             self.wg = np.zeros(len(bank.loops), np.float32)
             self.wg_target = np.zeros(len(bank.loops), np.float32)
             self.water = bank
-        return bank is not None
 
     def play_water(self, norm, lon, quiet=False):
-        """Water instead of a note: the value (0..1) crossfades from the calmest to the roughest recording."""
+        """Recordings instead of a note: the value (0..1) crossfades from the lowest to the highest recording."""
         self.note = None
         self.target.update(amp=0.0, noise=0.0, pan=float(np.clip(lon / 180.0, -1, 1)))
         if self.water is not None:
-            self.wg_target = (WaterBank.gains(norm, len(self.water.loops)) * (0.5 if quiet else 1.0)).astype(np.float32)
+            self.wg_target = (self.water.mix_gains(norm) * (0.5 if quiet else 1.0)).astype(np.float32)
 
     def _water_off(self):
         if self.wg_target is not None:
@@ -1576,7 +1631,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 # Start menu: choose the surface (virtual map / paper map / physical globe / virtual globe)
 # ----------------------------------------------------------------------------
 WIN_MENU = "Earth Jukebox"
-MENU_W, MENU_H = 640, 710
+MENU_W, MENU_H = 640, 790
 # (surface or action, title on screen, extra words only for the voice) - in the order shown and spoken
 MENU = [
     ("vmap", "Virtual map", "just the camera"),
@@ -1587,6 +1642,7 @@ MENU = [
     ("camera", "Camera", ""),
     ("import", "Add a map from a video", "or a picture: it becomes a new data layer"),
     ("voice", "Voice", ""),
+    ("sounds", "Sounds for a map", "your own recordings instead of notes"),
 ]
 CALIB_BACKUP = HERE / ".calibration_backup"
 
@@ -1700,6 +1756,8 @@ def menu_announcement(camera_name=None):
             parts.append(f"Press {k} to add a map from a video or a picture.")
         elif what == "voice":
             parts.append(f"Press {k} or V to turn the voice off; the sounds stay.")
+        elif what == "sounds":
+            parts.append(f"Press {k} to give a map your own sounds instead of notes.")
         else:
             parts.append(f"Press {k} for {title.lower()}, {needs}.")
     parts.append("Use the arrow keys and Enter, or press Q to quit.")
@@ -1756,7 +1814,7 @@ def choose_surface(args, camera_name=None):
                                      if ev == cv2.EVENT_LBUTTONDOWN else None)
                 selected = None
                 continue
-            if choice is not None and MENU[choice][0] in ("camera", "import"):
+            if choice is not None and MENU[choice][0] in ("camera", "import", "sounds"):
                 voice.stop()
                 return MENU[choice][0]
             if choice is not None:
@@ -2624,7 +2682,8 @@ def selftest(args):
         and "Press 5 to reset the calibration" in ann_m
     order = [m[1] for m in MENU]
     ok_mo = order == ["Virtual map", "Paper map", "Physical globe", "Virtual globe", "Reset calibration", "Camera",
-                      "Add a map from a video", "Voice"] and "Press 7 to add a map" in ann_m \
+                      "Add a map from a video", "Voice", "Sounds for a map"] and "Press 7 to add a map" in ann_m \
+        and "Press 9 to give a map your own sounds" in ann_m \
         and "Press 8 or V to turn the voice off" in ann_m
     # cameras: English labels, phone / external camera preferred, names from macOS (no camera is opened here)
     lab = [camera_label("Камера FaceTime HD", "AVCaptureDeviceTypeBuiltInWideAngleCamera"),
@@ -2798,6 +2857,13 @@ def main():
                     if new:
                         specs = L.discover_layers(args.month)  # the new layer is in the list at once
                         args.layer = new                       # and the next session starts with it
+                    surface = None
+                    continue
+                if surface == "sounds":                        # own recordings as the voice of a layer
+                    import sound_page as SPG
+                    if SPG.run(SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate),
+                               sound=not args.no_sound, volume=args.volume):
+                        specs = L.discover_layers(args.month)  # layers read their new sound setting
                     surface = None
                     continue
             if cap is None or cap_index != cam["index"]:

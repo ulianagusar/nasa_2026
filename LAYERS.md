@@ -143,7 +143,7 @@ Overrides any value from the metadata. All keys are optional:
 | `prefer` | `"json"` or `"u8"` - which file to read the data from |
 | `speech_note` | A sentence the voice adds after the value (e.g. "This is the difference from the 1951–1980 average.") |
 | `max_near_km` | If a point has no data, use the nearest cell only within this distance (default 300 km) |
-| `sound` | `"water"` - the layer is heard as a mix of water recordings instead of a note (see below) |
+| `sound` | A sound set instead of a note: `"water"` or the name of a set in `data/sounds/` (see below); `"note"` - notes (also overrides a built-in set) |
 | `sound_dir` | Folder with the water recordings and their `sounds.json` (default `data/currents_sounds`) |
 | `scale` | `"log"` - colours and note pitch follow the logarithm of the value (for values over several orders of magnitude). Set automatically by the importer |
 
@@ -187,6 +187,30 @@ gain_i = sqrt(max(0, 1 - |p - i|))          # constant total power - no volume d
 Longitude still sets the left/right balance. The mp3 files are decoded once with macOS `afconvert` into
 `data/currents_sounds/.decoded/`. The sound sources and licences are listed in `data/currents_sounds/CREDITS.txt`
 - only `stream` is described as CC0; check the other three before publishing.
+
+### Your own sounds for any map (sound sets)
+
+Water is just the first **sound set**. Any layer can get its own: start menu → **9. Sounds for a map** →
+choose the map → choose 1–8 audio files one after another, **from the lowest values to the highest**
+(wav, aiff, mp3, m4a, flac, caf ...) → listen: move the mouse along the colour scale of the map (or ← →) and
+hear the mix change exactly as it will under the finger → Enter. The same page can give a map an existing set
+(e.g. the water) or turn it back to notes. From the terminal:
+
+```bash
+.venv/bin/python sound_pack.py make fire calm_fire.wav crackle.m4a blaze.mp3 --layer temperature
+.venv/bin/python sound_pack.py attach temperature note        # back to notes
+.venv/bin/python sound_pack.py list                           # sets and which layer uses which
+```
+
+What happens to the files ([sound_pack.py](sound_pack.py)): silence at the ends is cut, at most 30 s are kept,
+the end is crossfaded into the start (a loop without a seam), the loudness is evened out - `rising` (higher
+values a little louder, like the water; default) or `equal` (L on the page). The set is written to
+`data/sounds/<set>/` (WAV + `sounds.json` in the same format as the water) and the layer gets
+`"sound": "<set>"` in its `jukebox.json` (for `sst`: `data/sst/jukebox.json`).
+
+Mixing: every recording has a `center` on the 0..1 scale (evenly spread by default; can be changed in
+`sounds.json`); between two neighbouring centers the two recordings crossfade with constant power
+(`gain = sqrt(share)`). With one recording only, its volume follows the value (0.2 → 1).
 
 ## Useful
 
