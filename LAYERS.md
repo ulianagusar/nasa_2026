@@ -19,6 +19,7 @@ position along the map); on the globe surfaces the time is set with the keys.
 | `temperature` | 147 frames, years 1880–2026 | Land and ocean temperature anomaly vs 1951–1980 | `data/temperature/` (NASA GISTEMP v4) |
 | `ocean_sst_video` | 48 frames, weeks 03.2007–02.2008 | Ocean temperature decoded from the colours of a video (ECCO2 model). The "normal" is the yearly mean of each cell | `data/ocean_sst_video/` (NASA SVS 3912) |
 | `ocean_flow_activity` | 48 frames, weeks 03.2007–02.2008 | Share of drawn current lines in a cell (0–1) - a visual index, not a speed | `data/ocean_flow_activity/` (NASA SVS 3912) |
+| `currents_speed` | 8 frames, months 01–08.2014 | Ocean surface current speed, m/s, monthly mean. **Heard as water** (calm river → roaring sea) instead of a note | `data/currents_speed/` (OSCAR, NASA PO.DAAC via NOAA ERDDAP) |
 
 Time in a layer is a sequence of **frames**: years (`temperature`) or dates (`ocean_*`). The left finger
 goes through all frames from the left to the right edge of the map. When the layer is switched, the
@@ -29,7 +30,7 @@ the whole planet) are skipped: there is nothing on the map to point at.
 
 ## How to add a new layer
 
-There are three ways, from the simplest.
+There are four ways. The first three need the numbers; the fourth reads them from the colours of a picture.
 
 ### 1. I have a NetCDF file (`.nc`) with a `(time, lat, lon)` variable
 
@@ -64,6 +65,47 @@ A folder `data/<name>/` with two files:
   quantization and no clipping at `vmin`/`vmax`), otherwise the `.u8.bin`. Override with `"prefer": "u8"` or `"json"` in `jukebox.json`.
 
 The order of latitudes and longitudes does not matter - the program sorts them.
+
+### 4. I only have a video or a picture of a map (with a colour scale)
+
+In the program: start menu → **7. Add a map from a video**. Or from the terminal:
+
+```bash
+.venv/bin/python media_to_layer.py video.mp4 --name humidity --title "Relative humidity" --units % \
+    --min 0 --max 100 --start 2020-01-01 --end 2020-12-31 --check check.png      # look first
+.venv/bin/python media_to_layer.py ... --save                                      # then save
+```
+
+Nothing is tuned to one kind of map; any quantity drawn with a colour scale works ([media_to_layer.py](media_to_layer.py)):
+
+1. **Colours.** The colour bar is found automatically, in the frame itself or in a separate picture
+   (`--palette scale.png`). The colours can also be typed (`--palette "stops:#313695:0,#ffffbf:15,#a50026:30"`)
+   or named (`--palette cmap:turbo`). You give the values at the two ends of the bar; the scale is
+   `linear`, `log` (concentrations, aerosols: e.g. 0.4 … 409.6) or `steps` (classes).
+2. **Map area.** Found automatically (the solid block under the data); drag the blue box on the page to fix it.
+   The map must be in plain lat/lon (equal degree steps). For a part of the world set the region:
+   `--region=-25,45,34,72` (west, east, south, north).
+3. **Reading.** Every pixel → the nearest colour of the scale in Lab. Pixels too far from all scale colours
+   (background, land, labels, blurred edges) are not data; the allowed distance is measured per file
+   (clean pictures are strict, compressed video gets more room). Thin things that never change between
+   frames (coastlines, a date stamp, a logo) are ignored.
+4. **Cells.** Median per cell. For sparse pictures (current lines, dots) 5 frames inside each time step are
+   combined; small holes between data are filled from the neighbours (their share is shown).
+   `--keep ocean` / `land` drops the other cells.
+5. **Time.** A video gives `--steps` time steps (48 by default) evenly between `--start` and `--end`; title or
+   credits frames with almost no data at the start or end are left out.
+
+There is no reference data, so the page shows internal checks: the share of map pixels that matched the scale,
+the share of filled cells, and the decoded map **painted with the same colours next to the original**, with
+coastlines on top (a shifted map box shows up at once). Nothing is saved before Enter.
+
+What is saved: the usual `data/<name>/` (the layer keeps the original colours), plus `import.json` (file,
+settings, numbers - how the layer was made) and a preset in `import_presets/`, so the next video of the
+same series needs only a check.
+
+Tested on: a map rendered from `wind_speed` (dense video: mean error 1.5% of the scale; sparse lines:
+7%), `sst_overview.png` against `sst.mnmean.nc` (mean error 0.23 °C), a log scale from `data/PM2.5_colorbar.png`
+(median error 2.7%).
 
 ## Layer settings: `data/<name>/jukebox.json` (optional)
 
@@ -101,6 +143,9 @@ Overrides any value from the metadata. All keys are optional:
 | `prefer` | `"json"` or `"u8"` - which file to read the data from |
 | `speech_note` | A sentence the voice adds after the value (e.g. "This is the difference from the 1951–1980 average.") |
 | `max_near_km` | If a point has no data, use the nearest cell only within this distance (default 300 km) |
+| `sound` | `"water"` - the layer is heard as a mix of water recordings instead of a note (see below) |
+| `sound_dir` | Folder with the water recordings and their `sounds.json` (default `data/currents_sounds`) |
+| `scale` | `"log"` - colours and note pitch follow the logarithm of the value (for values over several orders of magnitude). Set automatically by the importer |
 
 ## What the voice says
 
@@ -124,6 +169,22 @@ The same for every layer ([finger_map.py](finger_map.py), `Sonifier.play`):
 | no data | soft noise |
 
 If no `baseline` is set and the scale is not symmetric around zero, there is no "tension" - only the pitch is heard.
+
+### Water instead of a note (`"sound": "water"`)
+
+Used by `currents_speed`. `data/currents_sounds/` holds four looped recordings, from the calmest to the roughest
+(`calm`, `stream`, `rapids`, `roar`), listed in `sounds.json`. All four play at the same time; the value under
+the finger only changes their volumes:
+
+```
+s = (value - vmin) / (vmax - vmin)          # 0..1
+p = s * (N - 1)                             # N = 4 recordings
+gain_i = sqrt(max(0, 1 - |p - i|))          # constant total power - no volume dips between sounds
+```
+
+Longitude still sets the left/right balance. The mp3 files are decoded once with macOS `afconvert` into
+`data/currents_sounds/.decoded/`. The sound sources and licences are listed in `data/currents_sounds/CREDITS.txt`
+- only `stream` is described as CC0; check the other three before publishing.
 
 ## Useful
 

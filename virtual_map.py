@@ -164,7 +164,11 @@ class VirtualMap:
             i = np.clip(np.round((LAT - layer.lat[0]) / dlat).astype(int), 0, len(layer.lat) - 1)
             j = np.round((LON - layer.lon[0]) / dlon).astype(int) % len(layer.lon)
             val = grid[i, j]
-            nrm = np.clip((val - layer.vmin) / (layer.vmax - layer.vmin), 0, 1)
+            x0, x1, y0, y1 = layer.extent()
+            if x1 - x0 < 359:                                  # regional layer: nothing outside its area
+                lw = (LON + 180) % 360 - 180
+                val = np.where((LAT >= y0) & (LAT <= y1) & (lw >= x0) & (lw <= x1), val, np.nan)
+            nrm = layer.norm_array(val)
             rgb = layer.lut[np.nan_to_num(nrm * 255).astype(int)].copy()
             rgb[np.isnan(val)] = (170, 170, 165)
         else:

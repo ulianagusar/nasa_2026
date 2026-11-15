@@ -7,3 +7,4 @@ mediapipe
 opencv-python
 scipy
 sounddevice
+pyobjc-framework-AVFoundation; sys_platform == "darwin"

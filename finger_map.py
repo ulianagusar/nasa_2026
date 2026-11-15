@@ -858,6 +858,64 @@ def midi_name(m):
     return f"{NOTE_NAMES[m % 12]}{m // 12 - 1}"
 
 
+class WaterBank:
+    """Looped water recordings for layers with "sound": "water" (e.g. ocean currents).
+    sounds.json lists the files from the calmest to the roughest; all loops play at the same time and only
+    their volumes change with the value: s = 0..1, p = s * (N - 1), gain_i = sqrt(max(0, 1 - |p - i|)) -
+    the total power stays constant, so there are no volume dips between neighbouring sounds.
+    The mp3 files are decoded once with macOS `afconvert` into <sound_dir>/.decoded/*.wav."""
+
+    def __init__(self, sound_dir):
+        import subprocess
+        import wave
+        sound_dir = Path(sound_dir)
+        meta = json.loads((sound_dir / "sounds.json").read_text())
+        levels = sorted(meta["levels"], key=lambda l: l.get("center", 0))
+        cache = sound_dir / ".decoded"
+        cache.mkdir(exist_ok=True)
+        loops = []
+        for lv in levels:
+            src = sound_dir / lv["file"]
+            wav = cache / (src.stem + ".wav")
+            if not wav.exists() or wav.stat().st_mtime < src.stat().st_mtime:
+                subprocess.run(["afconvert", "-f", "WAVE", "-d", f"LEI16@{Sonifier.SR}", str(src), str(wav)],
+                               check=True, capture_output=True)
+            with wave.open(str(wav)) as w:
+                x = np.frombuffer(w.readframes(w.getnframes()), "<i2").reshape(-1, w.getnchannels())
+            x = x.astype(np.float32) / 32768.0
+            loops.append(x if x.shape[1] == 2 else np.repeat(x[:, :1], 2, 1))
+        n = min(len(x) for x in loops)
+        self.loops = np.stack([x[:n] for x in loops])          # (sounds, frames, 2)
+        self.names = [lv["name"] for lv in levels]
+        self.pos = 0
+
+    @staticmethod
+    def gains(s, n_sounds):
+        p = float(np.clip(s, 0, 1)) * (n_sounds - 1)
+        return np.sqrt(np.maximum(0.0, 1.0 - np.abs(p - np.arange(n_sounds))))
+
+    def block(self, n):
+        """Next n frames of every loop: (sounds, n, 2), wrapping around seamlessly."""
+        idx = (self.pos + np.arange(n)) % self.loops.shape[1]
+        self.pos = (self.pos + n) % self.loops.shape[1]
+        return self.loops[:, idx]
+
+
+_WATER_CACHE = {}
+
+
+def sonify(son, layer, s, lon):
+    """The sound for the value under the finger: water for layers with "sound": "water", otherwise a note."""
+    if s is None:
+        son.silence()
+    elif s["missing"]:
+        son.missing(lon)
+    elif layer.cfg.get("sound") == "water" and son.load_water(HERE / layer.cfg.get("sound_dir", "data/currents_sounds")):
+        son.play_water(s["norm"], lon, quiet=bool(s["near_km"]))
+    else:
+        son.play(s["norm"], s["tension"], lon, quiet=bool(s["near_km"]))
+
+
 class Sonifier:
     """Additive synthesizer whose parameters are driven by the data of any layer:
       value (norm 0..1)     -> note pitch (pentatonic) and timbre brightness (number of harmonics);
@@ -865,6 +923,7 @@ class Sonifier:
                                beating (second voice detuned) and a pulsing "heartbeat" when above;
       longitude             -> stereo panorama (west on the left, east on the right);
       no data               -> soft noise; announcement -> chime.
+    Layers with "sound": "water" are heard as a mix of looped water recordings instead (WaterBank).
     All changes are smooth (portamento/smoothing), so there are no clicks.
     render() also works without a sound card (for writing WAV files and tests)."""
     SR = 44100
@@ -882,6 +941,7 @@ class Sonifier:
         self.rng = np.random.default_rng()
         self.volume, self.muted, self.stream = volume, False, None
         self.note = None
+        self.water, self.wg, self.wg_target = None, None, None    # water loops and their (target) gains
         if enabled:
             try:
                 import sounddevice as sd
@@ -909,11 +969,44 @@ class Sonifier:
 
     def missing(self, lon):
         self.note = None
+        self._water_off()
         self.target.update(amp=0.0, noise=0.35, pan=float(np.clip(lon / 180.0, -1, 1)))
 
     def silence(self):
         self.note = None
+        self._water_off()
         self.target.update(amp=0.0, noise=0.0)
+
+    # --- water (layers with "sound": "water") ---
+    WATER_GAIN = 2.2                     # the loops are mastered quietly (-26..-17 LUFS); bring them up
+    WATER_TAU = 0.15
+
+    def load_water(self, sound_dir):
+        """Load (once, cached) the water loops of sound_dir. -> True if available."""
+        key = str(sound_dir)
+        if key not in _WATER_CACHE:
+            try:
+                _WATER_CACHE[key] = WaterBank(sound_dir)
+            except Exception as e:
+                print(f"  Water sounds not available ({e}); using notes instead.")
+                _WATER_CACHE[key] = None
+        bank = _WATER_CACHE[key]
+        if bank is not None and self.water is not bank:
+            self.wg = np.zeros(len(bank.loops), np.float32)
+            self.wg_target = np.zeros(len(bank.loops), np.float32)
+            self.water = bank
+        return bank is not None
+
+    def play_water(self, norm, lon, quiet=False):
+        """Water instead of a note: the value (0..1) crossfades from the calmest to the roughest recording."""
+        self.note = None
+        self.target.update(amp=0.0, noise=0.0, pan=float(np.clip(lon / 180.0, -1, 1)))
+        if self.water is not None:
+            self.wg_target = (WaterBank.gains(norm, len(self.water.loops)) * (0.5 if quiet else 1.0)).astype(np.float32)
+
+    def _water_off(self):
+        if self.wg_target is not None:
+            self.wg_target = np.zeros_like(self.wg_target)
 
     def chime(self):
         self.chime_f, self.chime_t = 2 * self.target["freq"], 0.0
@@ -966,7 +1059,16 @@ class Sonifier:
                 self.chime_f = None
         sig = np.tanh(1.2 * sig) / 1.2 * self.volume * duck
         theta = (pan + 1) * np.pi / 4                                 # equal-power panning
-        return np.stack([sig * np.cos(theta), sig * np.sin(theta)], 1).astype(np.float32)
+        out = np.stack([sig * np.cos(theta), sig * np.sin(theta)], 1)
+        if self.water is not None and (self.wg.any() or self.wg_target.any()):   # water loops crossfade
+            k = 1 - np.exp(-n / (self.SR * self.WATER_TAU))
+            g_new = self.wg + (self.wg_target - self.wg) * k
+            g = np.linspace(self.wg, g_new, n, endpoint=False).T        # (sounds, n) - smooth, no clicks
+            self.wg = g_new.astype(np.float32)
+            mix = (g[:, :, None] * self.water.block(n)).sum(0)          # (n, 2)
+            bal = np.stack([np.cos(theta), np.sin(theta)], 1) * np.sqrt(2)   # same west/east balance as notes
+            out = out + np.tanh(mix * bal * self.WATER_GAIN) * self.volume * duck[:, None]
+        return out.astype(np.float32)
 
     def _callback(self, outdata, frames, time_info, status):
         out = self.render(frames)
@@ -1326,12 +1428,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
         son.set_duck(voice.speaking())
 
         # ---- sound ----
-        if s is None:
-            son.silence()
-        elif s["missing"]:
-            son.missing(lon)
-        else:
-            son.play(s["norm"], s["tension"], lon, quiet=bool(s["near_km"]))
+        sonify(son, layer, s, lon)
         info["note"] = None if son.note is None else f"{midi_name(son.note)} · {midi_to_hz(son.note):.0f} Hz"
         info["muted"] = son.muted or son.stream is None
 
@@ -1461,23 +1558,88 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 # Start menu: choose the surface (virtual map / paper map / physical globe / virtual globe)
 # ----------------------------------------------------------------------------
 WIN_MENU = "Earth Jukebox"
-MENU_W, MENU_H = 560, 400
-# (surface, title on screen, what it needs - only for the voice) - in the order shown and spoken
+MENU_W, MENU_H = 640, 630
+# (surface or action, title on screen, extra words only for the voice) - in the order shown and spoken
 MENU = [
     ("vmap", "Virtual map", "just the camera"),
     ("map", "Paper map", "a printed world map on the table"),
     ("globe", "Physical globe", "a globe on a stand with blue oceans"),
     ("virtual", "Virtual globe", "just the camera"),
+    ("reset", "Reset calibration", "of the paper map and the physical globe"),
+    ("camera", "Camera", ""),
+    ("import", "Add a map from a video", "or a picture: it becomes a new data layer"),
 ]
+CALIB_BACKUP = HERE / ".calibration_backup"
+
+
+def calibration_files():
+    """Saved calibration of the paper map and of the physical globe (with its point memory)."""
+    return [CALIB_FILE, TEMPLATE_FILE, GB.GLOBE_CALIB, GB.GLOBE_MEMORY]
+
+
+def reset_calibration(files=None, backup_root=CALIB_BACKUP):
+    """Move the saved calibration files into backup_root/<date-time>/ (not deleted, can be restored by hand).
+    -> list of the files that were moved."""
+    import shutil
+    files = [Path(f) for f in (files or calibration_files()) if Path(f).exists()]
+    if not files:
+        return []
+    dest = Path(backup_root) / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        shutil.move(str(f), str(dest / f.name))
+    return files
+
+
+def render_confirm():
+    """Confirmation picture for the reset: only the question and the two answers."""
+    from PIL import Image, ImageDraw, ImageFont
+    from matplotlib import font_manager
+    bold = font_manager.findfont(font_manager.FontProperties(family="DejaVu Sans", weight="bold"))
+    font = ImageFont.truetype(bold, 34)
+    img = Image.new("RGB", (MENU_W, MENU_H), L.hex_rgb(SURFACE))
+    d = ImageDraw.Draw(img)
+    d.text((52, 56), "Reset calibration?", font=font, fill=L.hex_rgb(INK))
+    d.text((52, 176), "Y", font=font, fill=L.hex_rgb(INK2)); d.text((132, 176), "Yes", font=font, fill=L.hex_rgb(INK))
+    d.text((52, 256), "N", font=font, fill=L.hex_rgb(INK2)); d.text((132, 256), "No", font=font, fill=L.hex_rgb(INK))
+    return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+
+
+def confirm_reset(voice):
+    """Ask Y/N (screen + voice); on Y move the calibration files to the backup. -> True if reset."""
+    voice.speak("Reset calibration. This removes the saved calibration of the paper map and the physical globe, "
+                "so they will be calibrated again next time. Press Y to confirm, or N to cancel.")
+    clicked = []
+    cv2.setMouseCallback(WIN_MENU, lambda ev, x, y, *_: clicked.append(y)
+                         if ev == cv2.EVENT_LBUTTONDOWN else None)
+    while True:
+        cv2.imshow(WIN_MENU, render_confirm())
+        key = cv2.waitKey(30) & 0xFF
+        yes = key == ord("y") or (clicked and 166 <= clicked[-1] <= 226)
+        no = key in (ord("n"), 27, ord("q"), 8, 127) or (clicked and 246 <= clicked[-1] <= 306)
+        clicked.clear()
+        if yes:
+            moved = reset_calibration()
+            if moved:
+                print("Calibration reset. Moved to the backup: " + ", ".join(f.name for f in moved))
+                voice.speak("Calibration reset.")
+            else:
+                print("There was no saved calibration.")
+                voice.speak("There was no saved calibration.")
+            return bool(moved)
+        if no:
+            print("Reset cancelled.")
+            voice.speak("Cancelled.")
+            return False
 
 
 def _menu_rows():
-    """Row rectangles (x0, y0, x1, y1) of the four options."""
+    """Row rectangles (x0, y0, x1, y1) of the menu options."""
     top, row, pad = 40, 80, 30
     return [(pad, top + k * row, MENU_W - pad, top + k * row + row - 10) for k in range(len(MENU))]
 
 
-def render_menu(selected):
+def render_menu(selected, camera_name=None):
     """The menu picture (BGR): only the numbers and the option names. selected=None - nothing highlighted
     (a row is tinted only after the arrow keys were used)."""
     from PIL import Image, ImageDraw, ImageFont
@@ -1486,7 +1648,11 @@ def render_menu(selected):
     font = ImageFont.truetype(bold, 34)
     img = Image.new("RGB", (MENU_W, MENU_H), L.hex_rgb(SURFACE))
     d = ImageDraw.Draw(img)
-    for k, ((_, title, _), (x0, y0, x1, y1)) in enumerate(zip(MENU, _menu_rows())):
+    for k, ((what, title, _), (x0, y0, x1, y1)) in enumerate(zip(MENU, _menu_rows())):
+        if what == "camera" and camera_name:
+            title = f"Camera: {camera_name}"
+            while d.textlength(title, font=font) > (x1 - x0) - 100:   # long names: shorten to fit the row
+                title = title[:-2].rstrip() + "…" if not title.endswith("…") else title[:-2] + "…"
         if k == selected:
             d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=L.hex_rgb("#dbe8f8"))
         d.text((x0 + 22, y0 + 16), f"{k + 1}", font=font, fill=L.hex_rgb("#256abf" if k == selected else INK2))
@@ -1502,10 +1668,17 @@ def menu_hit(x, y):
     return None
 
 
-def menu_announcement():
+def menu_announcement(camera_name=None):
     parts = ["Earth Jukebox, start menu. Choose how you want to explore the Earth."]
-    for k, (_, title, needs) in enumerate(MENU, 1):
-        parts.append(f"Press {k} for {title.lower()}, {needs}.")
+    for k, (what, title, needs) in enumerate(MENU, 1):
+        if what == "reset":
+            parts.append(f"Press {k} to reset the calibration {needs}.")
+        elif what == "camera":
+            parts.append(f"Press {k} to choose the camera" + (f"; now: {camera_name}." if camera_name else "."))
+        elif what == "import":
+            parts.append(f"Press {k} to add a map from a video or a picture.")
+        else:
+            parts.append(f"Press {k} for {title.lower()}, {needs}.")
     parts.append("Use the arrow keys and Enter, or press Q to quit.")
     return " ".join(parts)
 
@@ -1515,10 +1688,11 @@ _UP = {63232, 2490368, 65362, 63234, 2424832, 65361}      # up or left
 _DOWN = {63233, 2621440, 65364, 63235, 2555904, 65363}    # down or right
 
 
-def choose_surface(args):
-    """Show the start menu, return the chosen surface ("vmap", "map", "globe", "virtual") or None to quit."""
+def choose_surface(args, camera_name=None):
+    """Show the start menu, return the chosen surface ("vmap", "map", "globe", "virtual"), "camera"
+    (choose another camera), "import" (add a map from a video or a picture) or None to quit."""
     voice = SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate)
-    voice.speak(menu_announcement())
+    voice.speak(menu_announcement(camera_name))
     print("=== START MENU === " + "  ".join(f"{k}. {m[1]}" for k, m in enumerate(MENU, 1)) + "   (q - quit)")
     selected, clicked = None, []                                # nothing highlighted until the arrows are used
     cv2.namedWindow(WIN_MENU, cv2.WINDOW_AUTOSIZE)
@@ -1526,7 +1700,7 @@ def choose_surface(args):
                          if ev == cv2.EVENT_LBUTTONDOWN else None)
     try:
         while True:
-            cv2.imshow(WIN_MENU, render_menu(selected))
+            cv2.imshow(WIN_MENU, render_menu(selected, camera_name))
             key = cv2.waitKeyEx(30)
             choice = None
             if clicked:
@@ -1543,7 +1717,18 @@ def choose_surface(args):
                     selected = 0 if key in _DOWN else len(MENU) - 1
                 else:
                     selected = (selected + (1 if key in _DOWN else -1)) % len(MENU)
-                voice.speak(f"{selected + 1}, {MENU[selected][1]}.")       # say the highlighted option
+                spoken = f"Camera: {camera_name}" if MENU[selected][0] == "camera" and camera_name else MENU[selected][1]
+                voice.speak(f"{selected + 1}, {spoken}.")                 # say the highlighted option
+            if choice is not None and MENU[choice][0] == "reset":    # an action, not a mode
+                voice.stop()
+                confirm_reset(voice)
+                cv2.setMouseCallback(WIN_MENU, lambda ev, x, y, *_: clicked.append(menu_hit(x, y))
+                                     if ev == cv2.EVENT_LBUTTONDOWN else None)
+                selected = None
+                continue
+            if choice is not None and MENU[choice][0] in ("camera", "import"):
+                voice.stop()
+                return MENU[choice][0]
             if choice is not None:
                 surf, title = MENU[choice][0], MENU[choice][1]
                 print(f"Mode: {title}")
@@ -1553,6 +1738,144 @@ def choose_surface(args):
                 return surf
     finally:
         cv2.destroyWindow(WIN_MENU)
+        cv2.waitKey(1)
+
+
+# ----------------------------------------------------------------------------
+# Cameras: names from macOS, live preview chooser, automatic choice of a phone / external camera
+# ----------------------------------------------------------------------------
+WIN_CAMS = "Choose a camera"
+
+
+def camera_label(name, device_type):
+    """English label for a camera (macOS gives names in the system language)."""
+    t = device_type or ""
+    if "Continuity" in t:
+        return "iPhone"
+    if "BuiltIn" in t:
+        return "Built-in camera"
+    if name and name.isascii():
+        return name                                            # e.g. Camo, DroidCam, Logitech ...
+    return "External camera"
+
+
+def camera_names():
+    """Video devices as macOS lists them, in the order OpenCV numbers them (sorted by uniqueID).
+    -> [(english label, is_builtin)] or None if the names are not available."""
+    try:
+        import AVFoundation as AV
+    except Exception:
+        return None
+    devs = list(AV.AVCaptureDevice.devicesWithMediaType_(AV.AVMediaTypeVideo))
+    devs += list(AV.AVCaptureDevice.devicesWithMediaType_(AV.AVMediaTypeMuxed))
+    devs = sorted(devs, key=lambda d: str(d.uniqueID()))
+    out = []
+    for d in devs:
+        t = str(d.deviceType()) if hasattr(d, "deviceType") else ""
+        out.append((camera_label(str(d.localizedName()), t), "BuiltIn" in t))
+    return out
+
+
+def list_cameras(max_probe=6):
+    """Cameras that really give a picture: [{"index", "name", "builtin"}]."""
+    names = camera_names()
+    n = len(names) if names else max_probe
+    cams = []
+    for i in range(n):
+        cap = cv2.VideoCapture(i)
+        ok = cap.isOpened() and cap.read()[0]
+        cap.release()
+        if ok:
+            name, builtin = names[i] if names and i < len(names) else (f"Camera {i + 1}", i == 0)
+            cams.append({"index": i, "name": name, "builtin": builtin})
+        elif not names:
+            break
+    # the same label twice (e.g. two external cameras without names) -> number them
+    for c in cams:
+        if sum(1 for o in cams if o["name"] == c["name"]) > 1:
+            c["name"] = f"{c['name']} {c['index'] + 1}"
+    return cams
+
+
+def auto_camera(cams):
+    """Prefer a phone or an external camera when one is connected, otherwise the built-in one."""
+    return next((c for c in cams if not c["builtin"]), cams[0])
+
+
+def open_camera(index, args):
+    cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(args.width * 9 / 16))
+    if not cap.isOpened():
+        raise SystemExit("The camera did not open. On macOS allow access: System Settings -> "
+                         "Privacy & Security -> Camera -> your terminal / VS Code.")
+    return cap
+
+
+def choose_camera(cams, current, args):
+    """Live previews of all cameras side by side; 1..N / click / arrows + Enter; Esc keeps the current one."""
+    voice = SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate)
+    voice.speak("Choose a camera. " + " ".join(f"Press {k} for {c['name']}." for k, c in enumerate(cams, 1))
+                + f" Now: {current['name']}. Press Escape to keep it.")
+    tw, th = 400, 225
+    caps = [cv2.VideoCapture(c["index"]) for c in cams]
+    selected, clicked = None, []
+    cols = min(len(cams), 3)
+    W = cols * (tw + 20) + 20
+    H = ((len(cams) + cols - 1) // cols) * (th + 70) + 20
+
+    def tile(k):
+        return 20 + (k % cols) * (tw + 20), 20 + (k // cols) * (th + 70)
+
+    def hit(x, y):
+        for k in range(len(cams)):
+            x0, y0 = tile(k)
+            if x0 <= x <= x0 + tw and y0 <= y <= y0 + th + 50:
+                return k
+        return None
+    cv2.namedWindow(WIN_CAMS, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(WIN_CAMS, lambda ev, x, y, *_: clicked.append(hit(x, y))
+                         if ev == cv2.EVENT_LBUTTONDOWN else None)
+    try:
+        while True:
+            img = np.full((H, W, 3), 251, np.uint8)
+            for k, (c, cap) in enumerate(zip(cams, caps)):
+                x0, y0 = tile(k)
+                ok, fr = cap.read()
+                if ok:
+                    img[y0:y0 + th, x0:x0 + tw] = cv2.resize(fr, (tw, th))
+                hl = (37, 106, 191) if (k == selected or (selected is None and c is current)) else (200, 200, 200)
+                cv2.rectangle(img, (x0 - 3, y0 - 3), (x0 + tw + 3, y0 + th + 3), hl, 3)
+                cv2.putText(img, f"{k + 1}  {c['name']}", (x0, y0 + th + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (30, 30, 30), 2, cv2.LINE_AA)
+            cv2.imshow(WIN_CAMS, img)
+            key = cv2.waitKeyEx(30)
+            choice = None
+            if clicked:
+                choice = clicked.pop()
+            elif key in (27, ord("b"), 8, 127, ord("q")):
+                voice.speak(f"Keeping {current['name']}.")
+                return current
+            elif 0 <= key < 256 and ord("1") <= key < ord("1") + len(cams):
+                choice = key - ord("1")
+            elif key in (13, 10, 32) and selected is not None:
+                choice = selected
+            elif key in _UP or key in _DOWN:
+                selected = (0 if key in _DOWN else len(cams) - 1) if selected is None else \
+                    (selected + (1 if key in _DOWN else -1)) % len(cams)
+                voice.speak(f"{selected + 1}, {cams[selected]['name']}.")
+            if choice is not None:
+                cam = cams[choice]
+                print(f"Camera: {cam['name']} (index {cam['index']})")
+                voice.speak(f"Camera: {cam['name']}.")
+                if cam is not current and (CALIB_FILE.exists() or GB.GLOBE_CALIB.exists()):
+                    print("  Note: the saved paper map / globe calibration was made with the camera in its old place; "
+                          "if anything is off, use Reset calibration in the menu.")
+                return cam
+    finally:
+        for cap in caps:
+            cap.release()
+        cv2.destroyWindow(WIN_CAMS)
         cv2.waitKey(1)
 
 
@@ -2171,10 +2494,7 @@ def selftest(args):
             i = min(int(seg[k]), len(points) - 2); f = seg[k] - i
             la, lo, yr = [points[i][q] + f * (points[i + 1][q] - points[i][q]) for q in range(3)]
             r_ = layer.sample(la, lo, layer.frame_at(yr + 0.5) if layer.dynamic else None)
-            if r_["missing"]:
-                son_.missing(lo)
-            else:
-                son_.play(r_["norm"], r_["tension"], lo, quiet=bool(r_["near_km"]))
+            sonify(son_, layer, r_, lo)                         # the same choice (note / water) as the app
             if k == nblk - int(1.2 * sr / blk):
                 son_.chime()
             chunks.append(son_.render(blk))
@@ -2188,22 +2508,87 @@ def selftest(args):
     if "temperature" in by:   # time machine: one point (Odesa), 1880 -> 2025
         demos.append(("sonification_odesa_1880_2025.wav", "Odesa 1880→2025 (temperature)",
                       render_route(by["temperature"], [(46.48, 30.73, 1880), (46.48, 30.73, 2025)], 20.0)))
+    if "currents_speed" in by:   # ocean currents as water: calm sea -> Gulf Stream -> equatorial current -> calm
+        cs = by["currents_speed"]
+        route = [(25, -50, 2014.04), (36, -71, 2014.04), (38, -60, 2014.04), (0, -120, 2014.04), (-25, -120, 2014.04)]
+        demos.append(("sonification_currents_demo.wav", "ocean currents as water (currents_speed)",
+                      render_route(cs, route, 16.0)))
     for fname, title, wav in demos:
         ok = np.abs(wav).max() < 0.99
         ok_all &= ok
         write_wav(out / fname, wav)
         print(f"   {title}: {len(wav) / sr:.0f} s, peak {np.abs(wav).max():.2f} {'OK' if ok else 'FAIL'} -> {fname}")
 
+    if "currents_speed" in by:
+        print("\n6a) Ocean currents -> water sounds:")
+        cs = by["currents_speed"]
+        d = json.loads((L.DATA_DIR / "currents_speed" / "currents_speed.json").read_text())
+        i = int(np.argmin(np.abs(np.array(d["lat"]) - 35.0))); j = int(np.argmin(np.abs(np.array(d["lon"]) + 73.0)))
+        got = cs.sample(35.0, -73.0, 0)["value"]
+        ok_cv = abs(got - d["data"][0][i][j]) < 1e-6 and cs.cfg.get("sound") == "water" and cs.unit == "m/s"
+        print(f"   currents_speed: {cs.n_frames} monthly frames {cs.labels[0]}…{cs.labels[-1]}; Gulf Stream "
+              f"{cs.time_label(0)}: {got:.2f} m/s (== json); sound = water {'OK' if ok_cv else 'FAIL'}")
+        gs_ = [WaterBank.gains(x_, 4) for x_ in np.linspace(0, 1, 13)]
+        ok_ep = all(abs((g_ ** 2).sum() - 1) < 1e-9 for g_ in gs_)
+        print(f"   crossfade gains keep constant power (sum g² = 1 for every speed) {'OK' if ok_ep else 'FAIL'}")
+        son_w = Sonifier(enabled=False)
+        ok_w = son_w.load_water(HERE / cs.cfg["sound_dir"])
+        levels = []
+        for x_ in (0.0, 0.33, 0.67, 1.0):                       # a few seconds at each speed
+            son_w.play_water(x_, 0.0); son_w.render(sr // 2)
+            levels.append(float(np.sqrt((son_w.render(2 * sr) ** 2).mean())))
+        son_w.play_water(0.5, 0.0); son_w.render(sr)
+        synth_silent = son_w.cur["amp"] < 0.01                  # no note while the water plays
+        ok_lv = ok_w and all(b_ > a_ for a_, b_ in zip(levels, levels[1:])) and synth_silent
+        print(f"   loudness rises with the speed: calm {levels[0]:.3f} -> stream {levels[1]:.3f} -> rapids "
+              f"{levels[2]:.3f} -> roar {levels[3]:.3f} (RMS); no note during water {'OK' if ok_lv else 'FAIL'}")
+        geo_c = SP.Geocoder()
+        msg_c = SP.compose(cs, 0, 35.0, -73.0, cs.sample(35.0, -73.0, 0), geo_c.locate(35.0, -73.0))
+        ok_sc = "m/s" in msg_c and "rougher the water" in msg_c
+        print(f"   🔊 {msg_c} {'OK' if ok_sc else 'FAIL'}")
+        ok_all &= ok_cv and ok_ep and ok_lv and ok_sc
+
     print("\n6b) Start menu:")
     rows = _menu_rows()
     hits = [menu_hit((x0 + x1) / 2, (y0 + y1) / 2) for x0, y0, x1, y1 in rows]
-    ok_mh = hits == [0, 1, 2, 3] and menu_hit(2, 2) is None
+    ok_mh = hits == list(range(len(MENU))) and menu_hit(2, 2) is None
     ann_m = menu_announcement()
-    ok_ma = all(f"Press {k} for {m[1].lower()}" in ann_m for k, m in enumerate(MENU, 1))
+    ok_ma = all(f"Press {k} for {m[1].lower()}" in ann_m for k, m in enumerate(MENU[:4], 1)) \
+        and "Press 5 to reset the calibration" in ann_m
     order = [m[1] for m in MENU]
-    ok_mo = order == ["Virtual map", "Paper map", "Physical globe", "Virtual globe"]
+    ok_mo = order == ["Virtual map", "Paper map", "Physical globe", "Virtual globe", "Reset calibration", "Camera",
+                      "Add a map from a video"] and "Press 7 to add a map" in ann_m
+    # cameras: English labels, phone / external camera preferred, names from macOS (no camera is opened here)
+    lab = [camera_label("Камера FaceTime HD", "AVCaptureDeviceTypeBuiltInWideAngleCamera"),
+           camera_label("Телефон Уляни", "AVCaptureDeviceTypeContinuityCamera"),
+           camera_label("Camo", "AVCaptureDeviceTypeExternal"), camera_label("Камера", "AVCaptureDeviceTypeExternal")]
+    pick = auto_camera([{"index": 0, "name": "Built-in camera", "builtin": True},
+                        {"index": 1, "name": "iPhone", "builtin": False}])
+    names_now = camera_names()
+    ok_cam = (lab == ["Built-in camera", "iPhone", "Camo", "External camera"] and pick["index"] == 1
+              and names_now is not None and all(n_.isascii() for n_, _ in names_now)
+              and "Press 6 to choose the camera; now: Built-in camera." in menu_announcement("Built-in camera"))
+    print(f"   cameras on this Mac: {[n_ for n_, _ in names_now or []]}; labels {lab}; "
+          f"a phone is preferred automatically {'OK' if ok_cam else 'FAIL'}")
+    ok_mo &= ok_cam
+    # reset: files are moved into a dated backup folder, nothing is lost
+    import shutil
+    tmp_c = out / "reset_test"
+    shutil.rmtree(tmp_c, ignore_errors=True)                    # clean start: backups from earlier runs
+    tmp_c.mkdir(parents=True)
+    fakes = [tmp_c / n for n in ("calibration.json", "globe_memory.npz")]
+    for f_ in fakes:
+        f_.write_text("x")
+    moved_ = reset_calibration(fakes + [tmp_c / "missing.json"], backup_root=tmp_c / "backup")
+    backups = list((tmp_c / "backup").glob("*/*"))
+    ok_rs = (len(moved_) == 2 and not any(f_.exists() for f_ in fakes) and len(backups) == 2
+             and reset_calibration([tmp_c / "nothing.json"], backup_root=tmp_c / "backup") == [])
+    print(f"   reset calibration: 2 files moved to {backups[0].parent.relative_to(out)}/, missing ones ignored "
+          f"{'OK' if ok_rs else 'FAIL'}")
+    cv2.imwrite(str(out / "selftest_menu_confirm.png"), render_confirm())
+    ok_mh &= ok_rs
     ok_kb = all(any(k_[0] == "b" for k_ in ks) for ks in (KEYS, KEYS_GLOBE, KEYS_VIRTUAL, KEYS_VMAP))
-    cv2.imwrite(str(out / "selftest_menu.png"), render_menu(None))
+    cv2.imwrite(str(out / "selftest_menu.png"), render_menu(None, "iPhone"))
     print(f"   options {order}; clicks on rows -> {hits}; announcement names all 4; "
           f"'b' = back to the menu in every mode {'OK' if ok_mh and ok_ma and ok_mo and ok_kb else 'FAIL'}")
     ok_all &= ok_mh and ok_ma and ok_mo and ok_kb
@@ -2252,7 +2637,9 @@ def run_session(cap, specs, args, scale, frame, surface):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--camera", type=int, default=0, help="camera index (0 - built-in)")
+    ap.add_argument("--camera", type=int, default=None,
+                    help="camera index (default: a connected phone / external camera if any, else the built-in one; "
+                         "can also be chosen in the start menu)")
     ap.add_argument("--recalibrate", action="store_true", help="calibrate again")
     ap.add_argument("--layer", help="data layer at start (name: sst, temperature, ...; see layers.py list)")
     ap.add_argument("--swap-hands", action="store_true",
@@ -2295,27 +2682,54 @@ def main():
     if args.layer and args.layer not in [s.name for s in specs]:
         raise SystemExit(f"No layer '{args.layer}'. Available: {', '.join(s.name for s in specs)}")
 
-    cap = cv2.VideoCapture(args.camera)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(args.width * 9 / 16))
-    if not cap.isOpened():
-        raise SystemExit("The camera did not open. On macOS allow access: System Settings -> "
+    cams = list_cameras()
+    if not cams:
+        raise SystemExit("No camera gives a picture. On macOS allow access: System Settings -> "
                          "Privacy & Security -> Camera -> your terminal / VS Code.")
+    print("Cameras: " + ", ".join(f"{c['index']}: {c['name']}" for c in cams))
+    if args.camera is not None:
+        cam = next((c for c in cams if c["index"] == args.camera), None)
+        if cam is None:
+            raise SystemExit(f"No camera {args.camera}. Available: " + ", ".join(str(c["index"]) for c in cams))
+    else:
+        cam = auto_camera(cams)
+    print(f"Using: {cam['name']} (index {cam['index']})")
+    cap, cap_index = None, None
     try:
-        frame = _read(cap)
-        scale = min(1.0, args.view / frame.shape[1])
         surface = args.surface                                 # --surface skips the menu the first time
         while True:
             if surface is None:                                # start menu: choose the mode
-                surface = choose_surface(args)
+                surface = choose_surface(args, cam["name"])
                 if surface is None:
                     return
+                if surface == "camera":                        # live previews of all cameras
+                    if cap is not None:
+                        cap.release(); cap, cap_index = None, None
+                    cams = list_cameras()
+                    cam = choose_camera(cams, next((c for c in cams if c["index"] == cam["index"]), cams[0]), args)
+                    surface = None
+                    continue
+                if surface == "import":                        # a new layer from a video / picture
+                    import import_page as IP
+                    new = IP.run(SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate))
+                    if new:
+                        specs = L.discover_layers(args.month)  # the new layer is in the list at once
+                        args.layer = new                       # and the next session starts with it
+                    surface = None
+                    continue
+            if cap is None or cap_index != cam["index"]:
+                if cap is not None:
+                    cap.release()
+                cap, cap_index = open_camera(cam["index"], args), cam["index"]
+            frame = _read(cap)
+            scale = min(1.0, args.view / frame.shape[1])
             if run_session(cap, specs, args, scale, frame, surface) != "menu":
                 return
             surface = None                                     # b / Backspace / Esc -> back to the menu
             args.recalibrate = False                           # recalibrate at most once per start
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
 
 

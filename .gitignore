@@ -17,6 +17,7 @@ calibration.json
 calibration_template.png
 globe_calibration.json
 globe_memory.npz
+.calibration_backup/
 
 # --- large data, downloaded separately (see the commands below) ---
 # NOAA ERSST v5, ~160 MB (GitHub does not accept files > 100 MB):

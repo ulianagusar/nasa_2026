@@ -638,7 +638,11 @@ class VirtualGlobe:
             i = np.clip(np.round((lat - layer.lat[0]) / dlat).astype(int), 0, len(layer.lat) - 1)
             j = np.round((lon - layer.lon[0]) / dlon).astype(int) % len(layer.lon)
             val = grid[i, j]
-            nrm = np.clip((val - layer.vmin) / (layer.vmax - layer.vmin), 0, 1)
+            x0, x1, y0, y1 = layer.extent()
+            if x1 - x0 < 359:                                  # regional layer: nothing outside its area
+                lw = (lon + 180) % 360 - 180
+                val = np.where((lat >= y0) & (lat <= y1) & (lw >= x0) & (lw <= x1), val, np.nan)
+            nrm = layer.norm_array(val)
             rgb = layer.lut[np.nan_to_num(nrm * 255).astype(int)].astype(float)
             rgb[np.isnan(val)] = (170, 170, 165)
         else:

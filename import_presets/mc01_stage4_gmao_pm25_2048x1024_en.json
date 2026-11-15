@@ -1,0 +1,37 @@
+{
+  "title": "Mc01 stage4 gmao pm25 2048x1024 en",
+  "units": "µg/m³",
+  "source": "",
+  "palette": {
+    "kind": "image",
+    "image": "/Users/ulanagusar/Desktop/nasa/import_presets/mc01_stage4_gmao_pm25_2048x1024_en_scale.png",
+    "box": [
+      71,
+      42,
+      463,
+      76
+    ],
+    "reverse": false
+  },
+  "scale": "linear",
+  "vmin": 0.4,
+  "vmax": 409.6,
+  "steps": 48,
+  "map_box": [
+    0,
+    0,
+    2048,
+    1024
+  ],
+  "region": [
+    -180.0,
+    180.0,
+    -90.0,
+    90.0
+  ],
+  "keep": "all",
+  "frame_size": [
+    2048,
+    1024
+  ]
+}

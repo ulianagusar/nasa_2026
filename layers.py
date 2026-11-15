@@ -57,6 +57,15 @@ BUILTIN = {
         "speech_note": "The temperature is estimated from the colours of a NASA video.",
         "source": "NASA SVS 3912, ECCO2 model (MIT/JPL)",
     },
+    "currents_speed": {
+        "title": "Ocean surface current speed",
+        "units": "m/s", "fmt": "{:.2f}", "cmap": "blues", "default_frame": 0,
+        "source": "OSCAR (ESR / NASA PO.DAAC) via NOAA ERDDAP",
+        "missing_label": "land / no data",
+        "note": "monthly mean; OSCAR is an analysis of satellite data, not a direct measurement",
+        "speech_note": "The faster the current, the rougher the water sounds.",
+        "sound": "water", "sound_dir": "data/currents_sounds",
+    },
     "ocean_flow_activity": {
         "title": "Ocean current activity from NASA video (0–1)",
         "units": "", "fmt": "{:.2f}", "cmap": "blues", "default_frame": 0,
@@ -68,7 +77,7 @@ BUILTIN = {
 }
 CFG_KEYS = ("title", "units", "source", "description", "note", "fmt", "vmin", "vmax", "cmap", "baseline",
             "base_label", "tension_scale", "default_year", "default_frame", "missing_label", "static_label",
-            "partial_years", "prefer", "speech_note", "max_near_km")
+            "partial_years", "prefer", "speech_note", "max_near_km", "sound", "sound_dir", "scale")
 
 
 def wrap180(lon):
@@ -137,6 +146,8 @@ class Layer:
         diverging = self.vmin < 0 < self.vmax
         self.cmap = cfg.get("cmap") or ("diverging" if diverging else "sequential")
         self.lut = make_lut(self.cmap)
+        # "scale": "log" - colours and note pitch follow the logarithm (concentrations, aerosols)
+        self.log = cfg.get("scale") == "log" and self.vmin > 0 and self.vmax > 0
         b = cfg.get("baseline", 0.0 if diverging else None)
         self.baseline = None if isinstance(b, str) else b      # "mean" is handled by GridLayer (grid of means)
         self.base_label = cfg.get("base_label", "the baseline")
@@ -200,7 +211,16 @@ class Layer:
         return ("≥ " if clipped > 0 else "≤ " if clipped < 0 else "") + s
 
     def norm(self, v):
-        return float(np.clip((v - self.vmin) / (self.vmax - self.vmin), 0, 1))
+        return float(self.norm_array(v))
+
+    def norm_array(self, v):
+        """Values -> 0..1 on the colour scale (NaN stays NaN); logarithmic for "scale": "log"."""
+        v = np.asarray(v, np.float64)
+        if self.log:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                x = (np.log(np.maximum(v, self.vmin)) - np.log(self.vmin)) / (np.log(self.vmax) - np.log(self.vmin))
+            return np.where(np.isnan(v), np.nan, np.clip(x, 0, 1))
+        return np.clip((v - self.vmin) / (self.vmax - self.vmin), 0, 1)
 
     def tension(self, v, base):
         return 0.0 if base is None or np.isnan(base) else float((v - base) / self.tension_scale)
@@ -274,7 +294,15 @@ class GridLayer(Layer):
         dlat = abs(self.lat[1] - self.lat[0]); dlon = abs(self.lon[1] - self.lon[0])
         return (self.lon[0] - dlon / 2, self.lon[-1] + dlon / 2, self.lat[0] - dlat / 2, self.lat[-1] + dlat / 2)
 
+    def covers(self, lat, lon):
+        """Is the point inside the area of the grid (always True for a whole-world grid)?"""
+        x0, x1, y0, y1 = self.extent()
+        world = x1 - x0 >= 359.0
+        return y0 <= lat <= y1 and (world or x0 <= wrap180(lon) <= x1)
+
     def sample(self, lat, lon, t=None):
+        if not self.covers(lat, lon):
+            return self._missing()
         g = self.grid(t)
         k = self.clamp_frame(t)
         i = int(np.argmin(np.abs(self.lat - lat)))
@@ -328,7 +356,11 @@ class GridLayer(Layer):
         if u8.exists() and (prefer == "u8" or not js.exists()):
             b = np.fromfile(u8, np.uint8).reshape(shape)
             vmin, vmax = float(meta["vmin"]), float(meta["vmax"])
-            data = np.where(b == 255, np.nan, vmin + b.astype(np.float32) / 254 * (vmax - vmin)).astype(np.float32)
+            if meta.get("scale") == "log" and vmin > 0:             # bytes spread over the logarithm
+                vals = np.exp(np.log(vmin) + b.astype(np.float64) / 254 * (np.log(vmax) - np.log(vmin)))
+            else:
+                vals = vmin + b.astype(np.float32) / 254 * (vmax - vmin)
+            data = np.where(b == 255, np.nan, vals).astype(np.float32)
             clipped = np.where(b == 254, 1, np.where(b == 0, -1, 0)).astype(np.int8)  # value at the edge of the scale
         else:
             raw = json.loads(js.read_text())["data"]
@@ -436,9 +468,10 @@ class LayerView:
         x = (self.W - w) // 2
         strip = np.repeat(layer.lut[np.linspace(0, 255, w).astype(int)][None], 12, axis=0)
         img.paste(Image.fromarray(strip), (x, y))
-        ticks = [layer.vmin, (layer.vmin + layer.vmax) / 2, layer.vmax]
+        mid = np.sqrt(layer.vmin * layer.vmax) if layer.log else (layer.vmin + layer.vmax) / 2
+        ticks = [layer.vmin, mid, layer.vmax]
         for v in ticks:
-            px = x + int((v - layer.vmin) / (layer.vmax - layer.vmin) * (w - 1))
+            px = x + int(layer.norm(v) * (w - 1))
             s = layer.fmt.format(v)
             d.text((px - d.textlength(s, font=self.fonts["xs"]) / 2, y + 16), s, font=self.fonts["xs"],
                    fill=hex_rgb(MUTED))
@@ -449,7 +482,7 @@ class LayerView:
         x0, y0, x1, y1 = self.MAP
         ext = layer.extent()
         g = layer.grid(year)[::-1]                             # north at the top
-        nrm = np.clip((g - layer.vmin) / (layer.vmax - layer.vmin), 0, 1)
+        nrm = layer.norm_array(g)
         rgb = layer.lut[np.nan_to_num(nrm * 255).astype(int)]
         rgb[np.isnan(g)] = hex_rgb(LANDC)
         rgb = cv2.resize(rgb, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
@@ -506,9 +539,10 @@ class LayerView:
 # Export: any array/NetCDF -> layer folder in the Earth Jukebox format
 # ----------------------------------------------------------------------------
 def write_layer(out_dir, name, years, lat, lon, data, units="", title="", source="", vmin=None, vmax=None,
-                diverging=False, extra_cfg=None, dates=None):
+                diverging=False, extra_cfg=None, dates=None, scale="linear"):
     """data: [frame][latitude][longitude] (NaN = no data); years - the year of each frame (None = a single moment);
     dates - optional frame dates 'YYYY-MM-DD' (for monthly/weekly data).
+    scale="log" - the bytes are spread evenly over the logarithm (vmin must be > 0).
     Writes <name>.meta.json, <name>.u8.bin, jukebox.json."""
     data = np.asarray(data, np.float32)
     if vmin is None or vmax is None:
@@ -518,12 +552,19 @@ def write_layer(out_dir, name, years, lat, lon, data, units="", title="", source
             vmin, vmax = float(np.nanpercentile(data, 1)), float(np.nanpercentile(data, 99))
     folder = Path(out_dir) / name
     folder.mkdir(parents=True, exist_ok=True)
-    b = np.where(np.isnan(data), 255, np.round((np.clip(data, vmin, vmax) - vmin) / (vmax - vmin) * 254)).astype(np.uint8)
+    log = scale == "log" and vmin > 0
+    if log:
+        x = (np.log(np.clip(data, vmin, vmax)) - np.log(vmin)) / (np.log(vmax) - np.log(vmin))
+    else:
+        x = (np.clip(data, vmin, vmax) - vmin) / (vmax - vmin)
+    b = np.where(np.isnan(data), 255, np.round(np.nan_to_num(x) * 254)).astype(np.uint8)
     b.tofile(folder / f"{name}.u8.bin")
     meta = {"layer": name, "description": title or name, "source": source, "units": units, "static": years is None,
             "years": None if years is None else [int(y) for y in years],
             "lat": [float(v) for v in lat], "lon": [float(v) for v in lon], "axis_order": "[year][lat][lon]",
             "vmin": float(vmin), "vmax": float(vmax), "null_meaning": "no data"}
+    if log:
+        meta["scale"] = "log"
     if dates is not None:
         meta["dates"] = [str(d)[:10] for d in dates]
     (folder / f"{name}.meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
