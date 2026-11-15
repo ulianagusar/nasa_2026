@@ -43,6 +43,7 @@ import numpy as np
 import layers as L
 import speech as SP
 import globe as GB
+import virtual_map as VM
 
 HERE = Path(__file__).resolve().parent
 CALIB_FILE = HERE / "calibration.json"
@@ -71,6 +72,11 @@ KEYS = [
     ("q", "the Q key", "quit"),
 ]
 # Virtual globe: the left hand rotates it, so time is on the keys; no calibration, but "north up" and size.
+# Virtual map: the left index finger sets the time (as on paper), left thumb + index spread zooms; no calibration.
+KEYS_VMAP = [k for k in KEYS if k[0] not in ("c", "k")] + [
+    ("+ -", "plus and minus", "zoom in or out around the centre"),
+    ("0", "zero", "zoom out to the whole world"),
+]
 KEYS_VIRTUAL = [k for k in KEYS if k[0] not in ("c", "k")] + [
     ("n", "the N key", "turn the globe north up"),
     ("+ -", "plus and minus", "make the globe bigger or smaller"),
@@ -858,7 +864,7 @@ class Panel:
             k = layer.clamp_frame(info["t"])
             d.text((x, y), f"{'Date' if layer.has_dates else 'Year'} {layer.time_label(k)}" + mode, font=self.f["s"],
                    fill=col("cool" if info.get("time_hand") else "ink2")); y += 22
-            how = "left hand along the map" if info.get("surface", "map") == "map" else "period (keys)"
+            how = "left hand along the map" if info.get("surface", "map") in ("map", "vmap") else "period (keys)"
             d.text((x, y), f"{how}: {layer.short_label(0)} ← → {layer.short_label(layer.n_frames - 1)}",
                    font=self.f["xs"], fill=col("muted")); y += 17
             d.text((x, y), f"frame {k + 1}/{layer.n_frames}   , . ±1   < > ±10   p ▶/❚❚", font=self.f["xs"],
@@ -909,9 +915,12 @@ class Panel:
         if gi is not None and info.get("sheet") == "tracked":
             st = (f"found ({gi['inliers']} points)" if gi["mode"] == "features" else "by land outlines")
             st += f" · learned {gi['coverage'] * 100:.0f}%"
+        if info.get("surface") == "vmap":
+            z = info.get("zoom") or 1.0
+            st = ("whole world" if z <= 1.001 else f"zoom x{z:.1f}") + " · left thumb+index spread = zoom · 0 world"
         if info.get("surface") == "virtual":
             st = "virtual · left pinch = rotate · n north up"
-        d.text((x, y), f"{'Map' if info.get('surface', 'map') == 'map' else 'Globe'}: {st}", font=self.f["xs"],
+        d.text((x, y), f"{'Map' if info.get('surface', 'map') in ('map', 'vmap') else 'Globe'}: {st}", font=self.f["xs"],
                fill=col("ink2")); y += 18
         snd = "off (m)" if info.get("muted") else (f"note {info['note']}" if info.get("note") else "silent")
         d.text((x, y), f"Sound: {snd}", font=self.f["xs"], fill=col("ink2")); y += 18
@@ -1207,10 +1216,13 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     mp, landmarker = make_landmarker()
     frame = _read(cap)
     virtual = isinstance(globe, GB.VirtualGlobe)
-    tracker = make_tracker(args.track, cal, frame.shape) if globe is None else (globe if virtual else globe.tracker)
-    keys = KEYS if globe is None else (KEYS_VIRTUAL if virtual else KEYS_GLOBE)
-    surface = "map" if globe is None else ("virtual" if virtual else "globe")
-    off_word = "finger is off the map" if globe is None else "finger is off the globe"
+    vmap = isinstance(globe, VM.VirtualMap)
+    drawn = virtual or vmap                    # drawn surfaces: mirrored frame, no calibration
+    tracker = make_tracker(args.track, cal, frame.shape) if globe is None else (globe if drawn else globe.tracker)
+    keys = KEYS if globe is None else (KEYS_VMAP if vmap else KEYS_VIRTUAL if virtual else KEYS_GLOBE)
+    surface = "map" if globe is None else ("vmap" if vmap else "virtual" if virtual else "globe")
+    off_word = "finger is off the map" if globe is None or vmap else "finger is off the globe"
+    zooming = False
     finger, time_finger = OneEuro(), OneEuro(min_cutoff=0.8)
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
     geo = SP.Geocoder()                                         # countries / seas / regions with English names
@@ -1225,7 +1237,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     t = layer.frame_at(None if args.year is None else args.year + 0.5)   # frame index of the layer
     playing, last_step = False, 0.0
     swap = args.swap_hands
-    if virtual:            # mirrored frame: MediaPipe's hand labels are then correct, do not swap them
+    if drawn:              # mirrored frame: MediaPipe's hand labels are then correct, do not swap them
         swap = not swap
 
     print("=== TRACKING === Data layers:")
@@ -1234,6 +1246,12 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     if globe is None:
         print("   RIGHT index finger: move over the map.")
         print("   LEFT index finger: time - slide along the map (left edge = first frame, right edge = last).")
+    elif vmap:
+        print("   Virtual map over the camera picture (mirrored, like a video call). The map does not move.")
+        print("   RIGHT index finger: point at the map.")
+        print("   LEFT index finger alone: time - slide along the map (left edge = first frame, right edge = last).")
+        print("   LEFT thumb + index out like an 'L' over a place: SPREAD them to zoom in, BRING TOGETHER to zoom out")
+        print("   (like on a phone screen); fold the thumb to keep the zoom; 0 = whole world.")
     elif virtual:
         print("   Virtual globe over the camera picture (mirrored, like a video call).")
         print("   RIGHT index finger: point at the globe.")
@@ -1301,7 +1319,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 
     while True:
         frame = _read(cap)
-        if virtual:
+        if drawn:
             frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         now = time.monotonic()
@@ -1313,6 +1331,10 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
         if globe is None:
             corners = tracker.update(frame)
             G = cam_to_sheet_H(corners)
+        elif vmap:                                             # left thumb+index spread = zoom; map drawn first,
+            zooming = globe.handle_left(roles.get("time"), w, h, now)   # finger marks go on top of it
+            G = globe.sheet_H()
+            globe.draw(frame, layer, t)
         elif virtual:                                          # left hand: pinch and move rotate the globe
             globe.handle_left(roles.get("time"), w, h, now)
         else:                                                  # globe rotation; the hand is not compared with the land map
@@ -1330,7 +1352,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 
         # ---- left hand: time ----
         time_hand = False
-        if "time" in roles and globe is None:
+        if "time" in roles and (globe is None or (vmap and not zooming)):
             lm = roles["time"][INDEX_TIP]
             tsmooth = time_finger(np.array([lm.x * w, lm.y * h]), now).copy()
             time_seen = now
@@ -1356,14 +1378,15 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 "inliers": getattr(tracker, "inliers", None), "layer": layer, "layer_idx": li + 1,
                 "n_layers": len(specs), "t": t, "playing": playing, "time_hand": time_hand,
                 "voice": voice.voice if voice.enabled else None, "speaking": voice.speaking(), "surface": surface,
-                "globe": None if globe is None or virtual else {"mode": getattr(tracker, "mode", "spin"),
+                "zoom": globe.zoom if vmap else None,
+                "globe": None if globe is None or drawn else {"mode": getattr(tracker, "mode", "spin"),
                                                      "inliers": getattr(tracker, "inliers", 0),
                                                      "coverage": tracker.coverage() if hasattr(tracker, "coverage") else 0}}
         lat = lon = None
         frac = 0.0
         # globe rotation speed: while it is being turned, the point under the finger changes - no announcement
         # (measured over ~1 s, not between neighbouring frames: jitter of the orientation estimate then does not add up)
-        if globe is not None:
+        if globe is not None and not vmap:
             spin_speed = spin.update(now, globe.R if virtual else globe.model.R())
         if smooth is not None:
             if globe is None:
@@ -1420,6 +1443,9 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             cv2.polylines(frame, [np.int32(corners)], True, qcol[tracker.status], 2)
             for p in corners:
                 cv2.circle(frame, (int(p[0]), int(p[1])), 6, qcol[tracker.status], -1)
+            if layer.dynamic:
+                draw_timeline(frame, G, layer, t, time_hand)
+        elif vmap:                                             # the map itself is already drawn above
             if layer.dynamic:
                 draw_timeline(frame, G, layer, t, time_hand)
         elif virtual:                                          # sphere with the layer data, coastlines, pinch
@@ -1484,8 +1510,14 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             globe.resize(1.1)
         if virtual and key in (ord("-"), ord("_")):
             globe.resize(1 / 1.1)
-        if virtual and key in (ord("c"), ord("k")):
-            pass                                               # the virtual globe needs no calibration
+        if vmap and key in (ord("+"), ord("=")):
+            globe.zoom_center(1.5)
+        if vmap and key in (ord("-"), ord("_")):
+            globe.zoom_center(1 / 1.5)
+        if vmap and key == ord("0"):
+            globe.reset()
+        if drawn and key in (ord("c"), ord("k")):
+            pass                                               # drawn surfaces need no calibration
         elif key == ord("c") and globe is not None:
             son.silence()
             globe = run_globe_calibration(cap, args, scale)
@@ -1494,7 +1526,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             son.silence()
             cal = run_calibration(cap, args, scale)
             tracker = make_tracker(args.track, cal, frame.shape)
-        if key == ord("k") and globe is not None and not virtual:
+        if key == ord("k") and globe is not None and not drawn:
             # the lighting changed -> relearn the "water/land" colours at the current rotation
             hm = hands_mask(res, w, h) if res.hand_landmarks else None
             tracker.learn_colors(frame, None, hand_mask=hm)
@@ -1502,7 +1534,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 tracker.memory.add_from_frame(frame, globe.model, tracker.orb, hm, min_facing=0.6)
             GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)
             print("Globe colours relearned, current side remembered")
-        elif key == ord("k") and not virtual:
+        elif key == ord("k") and not drawn:
             # the same 4 corners again (e.g. the lighting changed) -> new template, the place calibration is kept
             son.silence()
             corners = pick_corners(cap, scale)
@@ -1515,7 +1547,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     voice.stop()
     son.close()
     landmarker.close()
-    if globe is not None and not virtual:
+    if globe is not None and not drawn:
         GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)       # last pose + newly remembered sides
 
 
@@ -1997,6 +2029,99 @@ def selftest(args):
     print(f"   still globe with orientation jitter 0.3°/frame: fired at {f4} s  {'OK' if ok_fx else 'FAIL'}")
     ok_all &= ok_fx
 
+    print("\n5f) Virtual map (fixed map, left thumb+index spread = zoom, left index alone = time):")
+    vm = VM.VirtualMap((1280, 720))
+    c1, c2 = vm.to_latlon(vm.x0, vm.y0), vm.to_latlon(vm.x0 + vm.mw, vm.y0 + vm.mh)
+    ok_c = abs(c1[0] - 90) < 1e-6 and abs(c1[1] + 180) < 1e-6 and abs(c2[0] + 90) < 1e-6 and abs(c2[1] - 180) < 1e-6
+    print(f"   whole world: corners {c1[0]:.0f},{c1[1]:.0f} and {c2[0]:.0f},{c2[1]:.0f} {'OK' if ok_c else 'FAIL'}")
+    nx_, ny_ = [float(v) for v in vm.to_px(40.7, -74.0)]
+    vm.zoom_about(nx_, ny_, 4.0)
+    keep = vm.to_latlon(nx_, ny_)
+    ok_z = abs(keep[0] - 40.7) < 1e-6 and abs(keep[1] + 74.0) < 1e-6 and abs(vm.lon_span - 90) < 1e-9
+    print(f"   zoom x4 over New York: the same place stays under the fingers {'OK' if ok_z else 'FAIL'}")
+    vm.reset()
+    vm.zoom_about(vm.x0 + 2, vm.y0 + 2, 6.0)                    # zoom at the very corner: view stays inside the world
+    ok_e = vm.lon_min >= -180 - 1e-9 and vm.lat_max <= 90 + 1e-9
+    print(f"   zoom at the map corner stays inside the world {'OK' if ok_e else 'FAIL'}")
+    vm.reset()
+
+    def mhand(cx, cy, spread_px, thumb_out=True):
+        """Fake left hand: fingertips at the top around (cx, cy), palm below (palm size 90 px).
+        thumb_out=False - thumb folded against the middle finger (pointing pose = time control)."""
+        pts = [NS(x=cx / 1280, y=(cy + 60) / 720) for _ in range(21)]
+        pts[0] = NS(x=cx / 1280, y=(cy + 170) / 720)            # wrist
+        pts[9] = NS(x=cx / 1280, y=(cy + 80) / 720)             # middle-finger base
+        pts[10] = NS(x=cx / 1280, y=(cy + 70) / 720)            # middle-finger PIP (finger folded)
+        pts[8] = NS(x=(cx + spread_px / 2) / 1280, y=cy / 720)  # index tip
+        pts[4] = (NS(x=(cx - spread_px / 2) / 1280, y=cy / 720) if thumb_out
+                  else NS(x=(cx + 5) / 1280, y=(cy + 65) / 720))  # thumb tip
+        return pts
+    ax_, ay_ = [float(v) for v in vm.to_px(5.0, 20.0)]           # over Africa
+    clock = iter(np.arange(0, 100, 1 / 30))
+    zs = [vm.zoom]
+    for _ in range(5):                                          # "L" held only ~0.15 s: too short, no zoom
+        vm.handle_left(mhand(ax_, ay_, 27), 1280, 720, next(clock))
+    for _ in range(5):
+        vm.handle_left(mhand(ax_, ay_, 81, thumb_out=False), 1280, 720, next(clock))
+    zs.append(vm.zoom)
+    for _ in range(10):                                         # "L" over Africa, fingers close (0.3 palm)
+        vm.handle_left(mhand(ax_, ay_, 27), 1280, 720, next(clock))
+    for sp_ in np.linspace(27, 81, 12):                         # spread the fingers to 0.9 palm = zoom in
+        vm.handle_left(mhand(ax_, ay_, sp_), 1280, 720, next(clock))
+    zs.append(vm.zoom)
+    anchor_ok = np.allclose(vm.to_latlon(ax_, ay_)[:2], (5.0, 20.0), atol=1e-6)
+    for k_ in range(5):                                         # fold the thumb, move around: zoom is kept
+        vm.handle_left(mhand(ax_ + 40 * k_, ay_ + 60, 27, thumb_out=False), 1280, 720, next(clock))
+    zs.append(vm.zoom)
+    for _ in range(10):                                         # "L" again with fingers wide apart ...
+        vm.handle_left(mhand(ax_, ay_, 81), 1280, 720, next(clock))
+    for sp_ in np.linspace(81, 27, 12):                         # ... and bring them together = zoom out
+        vm.handle_left(mhand(ax_, ay_, sp_), 1280, 720, next(clock))
+    zs.append(vm.zoom)
+    expect_in = (81 / 27) ** VM.VirtualMap.ZOOM_POWER
+    ok_g = (zs[1] == zs[0] and abs(zs[2] - expect_in) < 0.05 and anchor_ok and zs[3] == zs[2]
+            and abs(zs[4] - 1.0) < 0.05)
+    print(f"   brief 'L' (<0.25 s): zoom stays {zs[1]:.1f}; 'L' over Africa + spread fingers x3: "
+          f"{zs[0]:.1f} -> {zs[2]:.1f} (Africa stays put); thumb folded: stays {zs[3]:.1f}; "
+          f"fingers together: {zs[4]:.1f} {'OK' if ok_g else 'FAIL'}")
+    vm.handle_left(None, 1280, 720)
+    tl_ = next((l_ for l_ in by.values() if l_.dynamic), None)
+    ok_tm = True
+    if tl_ is not None:                                          # time: the left index along the map, as on paper
+        Gv = vm.sheet_H()
+        u_l = apply_H(Gv, [[vm.x0 + 1, vm.y0 + vm.mh / 2]])[0][0]
+        u_r = apply_H(Gv, [[vm.x0 + vm.mw - 1, vm.y0 + vm.mh / 2]])[0][0]
+        k_l, k_r = frame_from_u(tl_, u_l, None), frame_from_u(tl_, u_r, None)
+        ok_tm = k_l == 0 and k_r == tl_.n_frames - 1
+        print(f"   left index along the map -> time: left edge {tl_.labels[k_l]}, right edge {tl_.labels[k_r]} "
+              f"{'OK' if ok_tm else 'FAIL'}")
+    fxv = Fixation(3.0, 0.02 * 1280)                             # zooming under a still finger: no announcement
+    vm.reset()
+    pxv = np.array([vm.x0 + vm.mw * 0.55, vm.y0 + vm.mh * 0.45])
+    latlon_vm = lambda x, y: vm.to_latlon(x, y)[:3]
+    fired_v = []
+    for k_ in range(240):                                       # 8 s: zooming for 3 s, then 5 s still
+        now_ = k_ / 30
+        if k_ < 90:
+            vm.zoom_about(vm.x0 + vm.mw * 0.2, vm.y0 + vm.mh * 0.3, 1.0 + k_ * 0.05)   # zooming for 3 s elsewhere
+        la_, lo_, okv = latlon_vm(*pxv)
+        if fxv.should_fire(fxv.update(now_, pxv, okv, la_, lo_, latlon_vm, 0.0)):
+            fired_v.append(round(now_, 1))
+    ok_fv = len(fired_v) == 1 and fired_v[0] >= 5.0
+    print(f"   zooming for 3 s under a still finger, then still: announced at {fired_v} s "
+          f"(expected ≈ 3 + 3 s) {'OK' if ok_fv else 'FAIL'}")
+    fr_m = np.full((720, 1280, 3), 110, np.uint8)
+    vm.reset()
+    t0_ = time.perf_counter(); vm.draw(fr_m, tl_ or next(iter(by.values())), 0); dt_m = (time.perf_counter() - t0_) * 1000
+    vm.zoom_about(*[float(v) for v in vm.to_px(5.0, 20.0)], 4.0)
+    fr_m2 = np.full((720, 1280, 3), 110, np.uint8); vm.draw(fr_m2, tl_ or next(iter(by.values())), 0)
+    cv2.imwrite(str(out / "selftest_virtual_map.png"), np.vstack([fr_m, fr_m2]))
+    hm_ = SP.help_announcement(KEYS_VMAP, len(specs), "vmap")
+    ok_hm = "spread them apart" in hm_ and "left index finger along the map" in hm_ and "Zero" in hm_
+    print(f"   drawing {dt_m:.0f} ms when the view changes; help mentions zoom, time and the zero key "
+          f"{'OK' if ok_hm else 'FAIL'}")
+    ok_all &= ok_c and ok_z and ok_e and ok_g and ok_tm and ok_fv and ok_hm
+
     print("\n6) Sonification (synthesis without a sound card):")
     sr = Sonifier.SR
     base_layer = by.get("sst") or next(iter(by.values()))
@@ -2100,9 +2225,10 @@ def main():
     ap.add_argument("--projection", default="equirect", choices=PROJECTIONS,
                     help="projection, if only 4 places were clicked")
     ap.add_argument("--lon0", type=float, default=0.0, help="central meridian of the map, if only 4 places")
-    ap.add_argument("--surface", default="map", choices=["map", "globe", "virtual"],
+    ap.add_argument("--surface", default="map", choices=["map", "globe", "virtual", "vmap"],
                     help="map - paper map (as before), globe - globe on a stand with an axis, "
-                         "virtual - virtual globe over the camera picture (rotated with a left-hand pinch)")
+                         "virtual - virtual globe over the camera picture (rotated with a left-hand pinch), "
+                         "vmap - virtual flat map over the camera picture (left thumb+index spread = zoom)")
     ap.add_argument("--track", default="features", choices=["features", "contour", "static"],
                     help="how to track the map: features - by the map picture (default), "
                          "contour - by the sheet edges, static - the map does not move")
@@ -2137,6 +2263,9 @@ def main():
     try:
         frame = _read(cap)
         scale = min(1.0, args.view / frame.shape[1])
+        if args.surface == "vmap":                             # nothing to calibrate: the map is drawn
+            run_tracking(cap, None, specs, args, scale, globe=VM.VirtualMap((frame.shape[1], frame.shape[0])))
+            return
         if args.surface == "virtual":                          # nothing to calibrate: the globe is drawn
             run_tracking(cap, None, specs, args, scale, globe=GB.VirtualGlobe((frame.shape[1], frame.shape[0])))
             return

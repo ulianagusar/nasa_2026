@@ -295,7 +295,7 @@ def layer_intro(idx, n, layer, surface="map"):
     """Short message when switching maps."""
     s = f"Map {idx} of {n}: {spoken_title(layer)}. {_cap(spoken_range(layer))}."
     if layer.dynamic:
-        s += (" Move your left hand along the map to change the time." if surface == "map"
+        s += (" Move your left hand along the map to change the time." if surface in ("map", "vmap")
               else " Use comma and period to change the time.")
     return s
 
@@ -320,7 +320,18 @@ _SOUND_EXPLAINED = ("The pitch tells you the value at that spot: a higher sound 
 
 def help_announcement(keys, n_layers, surface="map"):
     """What the program does and what each key does. keys: [(key, how to say it, what it does)]."""
-    if surface == "virtual":
+    if surface == "vmap":
+        intro = ("Earth Jukebox, a sound map of the Earth. A world map is drawn on top of the camera picture. "
+                 "Point at it with the index finger of your right hand. " + _SOUND_EXPLAINED + " "
+                 "Hold your right finger still for three seconds, and I will tell you the place, the time, "
+                 "and the value. Slide your left index finger along the map to change the time: "
+                 "the left edge is the oldest data, the right edge is the newest. "
+                 "To zoom, hold your left thumb and index finger out over a place, like on a phone screen: "
+                 "spread them apart to zoom in, bring them together to zoom out. Fold your thumb to keep the zoom. "
+                 "The map itself does not move: "
+                 "to go somewhere else, zoom out first, then zoom in over the new place. "
+                 "Press zero to see the whole world again.")
+    elif surface == "virtual":
         intro = ("Earth Jukebox, a sound map of the Earth. A globe is drawn on top of the camera picture. "
                  "Point at it with the index finger of your right hand. " + _SOUND_EXPLAINED + " "
                  "To turn the globe, pinch your left thumb and index finger together, as if you were holding it, "
