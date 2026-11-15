@@ -18,7 +18,8 @@ The camera looks at a printed world map. The program:
   * if the finger stays still for 3 seconds, the point is announced and printed to the console (with a chime).
 
 Run:
-    .venv/bin/python finger_map.py                 # calibration (first time) + tracking
+    .venv/bin/python finger_map.py                 # start menu: virtual map / paper map / physical globe / virtual globe
+    .venv/bin/python finger_map.py --surface vmap  # skip the menu (map, globe, virtual, vmap)
     .venv/bin/python finger_map.py --recalibrate   # calibrate again
     .venv/bin/python finger_map.py --selftest      # check the maths without a camera
 
@@ -69,6 +70,7 @@ KEYS = [
     ("h", "the H key", "swap hands if the program mixes them up"),
     ("c", "the C key", "recalibrate the map"),
     ("k", "the K key", "mark the map corners again"),
+    ("b", "the B key", "back to the start menu"),
     ("q", "the Q key", "quit"),
 ]
 # Virtual globe: the left hand rotates it, so time is on the keys; no calibration, but "north up" and size.
@@ -807,11 +809,8 @@ def globe_tour(cap, tracker, scale, win="Calibration", target=0.95):
 
 
 # ----------------------------------------------------------------------------
-# Console report and the panel with the live value of the layer (PIL, for proper text rendering)
+# Console report and the on-screen header (map name + year)
 # ----------------------------------------------------------------------------
-ROLE_COLORS = {"ink": INK, "ink2": INK2, "muted": MUTED, "warm": WARM, "cool": COOL}
-
-
 def report(layer, t, lat, lon, s):
     head = f"[{datetime.now():%H:%M:%S}] {L.fmt_coord(lat, lon)} · {layer.title}, {layer.time_label(t)}"
     if s is None or s["missing"]:
@@ -820,125 +819,22 @@ def report(layer, t, lat, lon, s):
     return f"{head} -> {s['text']}" + (" | " + " | ".join(extra) if extra else "")
 
 
-def _wrap_px(d, text, font, width):
-    words, lines, cur = text.split(), [], ""
-    for w in words:
-        test = f"{cur} {w}".strip()
-        if cur and d.textlength(test, font=font) > width:
-            lines.append(cur); cur = w
-        else:
-            cur = test
-    return lines + [cur] if cur else lines
-
-
-class Panel:
-    def __init__(self, width):
-        self.w = width
-        self.f = L.get_fonts()
-        self.bar_w = width - 40
-        self._bars = {}
-
-    def _bar(self, layer):
-        if layer.name not in self._bars:
-            self._bars[layer.name] = np.repeat(layer.lut[np.linspace(0, 255, self.bar_w).astype(int)][None], 14, axis=0)
-        return self._bars[layer.name]
-
-    def _text(self, d, x, y, text, font, role, width, lh, max_lines=2):
-        for line in _wrap_px(d, text, font, width)[:max_lines]:
-            d.text((x, y), line, font=font, fill=L.hex_rgb(ROLE_COLORS[role])); y += lh
-        return y
-
-    def render(self, height, info):
-        from PIL import Image, ImageDraw
-        layer, s = info["layer"], info.get("sample")
-        img = Image.new("RGB", (self.w, height), L.hex_rgb(SURFACE))
-        d = ImageDraw.Draw(img)
-        x, y, W = 20, 14, self.w - 40
-        col = lambda role: L.hex_rgb(ROLE_COLORS[role])
-        n = info["n_layers"]
-        d.text((x, y), f"LAYER {info['layer_idx']}/{n}  ·  l or 1–{min(n, 9)}: switch", font=self.f["xs"],
-               fill=col("muted")); y += 20
-        y = self._text(d, x, y, layer.title, self.f["l"], "ink", W, 22)
-        if layer.dynamic:
-            mode = ("   ✋ left hand" if info.get("time_hand") else "   ▶ playing" if info.get("playing") else "")
-            k = layer.clamp_frame(info["t"])
-            d.text((x, y), f"{'Date' if layer.has_dates else 'Year'} {layer.time_label(k)}" + mode, font=self.f["s"],
-                   fill=col("cool" if info.get("time_hand") else "ink2")); y += 22
-            how = "left hand along the map" if info.get("surface", "map") in ("map", "vmap") else "period (keys)"
-            d.text((x, y), f"{how}: {layer.short_label(0)} ← → {layer.short_label(layer.n_frames - 1)}",
-                   font=self.f["xs"], fill=col("muted")); y += 17
-            d.text((x, y), f"frame {k + 1}/{layer.n_frames}   , . ±1   < > ±10   p ▶/❚❚", font=self.f["xs"],
-                   fill=col("muted")); y += 20
-        else:
-            d.text((x, y), layer.time_label(None) + " (single snapshot)", font=self.f["s"], fill=col("ink2")); y += 22
-        y += 4
-        d.line([(x, y), (self.w - 20, y)], fill=L.hex_rgb(GRIDC)); y += 10
-
-        d.text((x, y), "UNDER YOUR RIGHT FINGER", font=self.f["xs"], fill=col("muted")); y += 20
-        if info.get("pos"):
-            d.text((x, y), L.fmt_coord(*info["pos"]), font=self.f["m"], fill=col("ink")); y += 28
-            if info.get("edge"):
-                d.text((x, y), "near the edge of the globe: less accurate", font=self.f["xs"], fill=col("muted")); y += 18
-        if s is not None:
-            if s["missing"]:
-                d.text((x, y), layer.missing_label, font=self.f["xl"], fill=col("ink2")); y += 60
-            else:
-                big = self.f["xl"] if d.textlength(s["text"], font=self.f["xl"]) <= W else self.f["m"]
-                d.text((x, y), s["text"], font=big, fill=col("ink")); y += 60 if big is self.f["xl"] else 32
-                for t, role in s["lines"]:
-                    small = role == "muted"
-                    y = self._text(d, x, y, t, self.f["xs"] if small else self.f["s"], role, W, 18 if small else 22)
-        else:
-            msg = {"nohand": "no hand in view", "offmap": "finger is off the map"}.get(info.get("state"), "")
-            d.text((x, y), msg, font=self.f["m"], fill=col("ink2")); y += 40
-
-        y += 12                                                # layer scale with a marker
-        img.paste(Image.fromarray(self._bar(layer)), (x, y))
-        if s is not None and not s["missing"]:
-            px = x + int(s["norm"] * (self.bar_w - 1))
-            d.polygon([(px - 6, y - 9), (px + 6, y - 9), (px, y - 1)], fill=col("ink"))
-        for v in (layer.vmin, (layer.vmin + layer.vmax) / 2, layer.vmax):
-            px = x + int((v - layer.vmin) / (layer.vmax - layer.vmin) * (self.bar_w - 1))
-            t = layer.fmt.format(v)
-            tx = min(max(px - d.textlength(t, font=self.f["xs"]) / 2, x), x + self.bar_w - d.textlength(t, font=self.f["xs"]))
-            d.text((tx, y + 17), t, font=self.f["xs"], fill=col("muted"))
-        y += 42
-        d.line([(x, y), (self.w - 20, y)], fill=L.hex_rgb(GRIDC)); y += 10
-
-        if layer.source:
-            y = self._text(d, x, y, f"Data: {layer.source}", self.f["xs"], "ink2", W, 17)
-        st = {"tracked": "found", "held": "holding (map not visible)", "searching": "searching...",
-              "static": "fixed"}[info.get("sheet", "static")]
-        if info.get("inliers") and info.get("sheet") == "tracked":
-            st += f" ({info['inliers']} points)"
-        gi = info.get("globe")
-        if gi is not None and info.get("sheet") == "tracked":
-            st = (f"found ({gi['inliers']} points)" if gi["mode"] == "features" else "by land outlines")
-            st += f" · learned {gi['coverage'] * 100:.0f}%"
-        if info.get("surface") == "vmap":
-            z = info.get("zoom") or 1.0
-            st = ("whole world" if z <= 1.001 else f"zoom x{z:.1f}") + " · left thumb+index spread = zoom · 0 world"
-        if info.get("surface") == "virtual":
-            st = "virtual · left pinch = rotate · n north up"
-        d.text((x, y), f"{'Map' if info.get('surface', 'map') in ('map', 'vmap') else 'Globe'}: {st}", font=self.f["xs"],
-               fill=col("ink2")); y += 18
-        snd = "off (m)" if info.get("muted") else (f"note {info['note']}" if info.get("note") else "silent")
-        d.text((x, y), f"Sound: {snd}", font=self.f["xs"], fill=col("ink2")); y += 18
-        vo = info.get("voice")
-        d.text((x, y), "Voice: " + ("speaking…" if info.get("speaking") else vo or "off (v)") +
-               ("   r repeat" if vo else ""), font=self.f["xs"], fill=col("ink2")); y += 24
-        frac = info.get("dwell", 0.0)
-        d.text((x, y), "Hold still for 3 s to announce", font=self.f["xs"], fill=col("ink2")); y += 18
-        d.rectangle([x, y, self.w - 20, y + 8], fill=L.hex_rgb(GRIDC))
-        if frac > 0:
-            d.rectangle([x, y, x + int(W * frac), y + 8], fill=L.hex_rgb("#0ca30c" if frac >= 1 else "#eb6834"))
-        y += 20
-        if info.get("last_fix"):
-            d.text((x, y), "Last announcement:", font=self.f["xs"], fill=col("muted")); y += 18
-            self._text(d, x, y, info["last_fix"], self.f["xs"], "ink", W, 17, max_lines=4)
-        d.text((x, height - 42), "? help · i maps · r repeat · v voice", font=self.f["xs"], fill=col("muted"))
-        d.text((x, height - 24), "q quit · m sound · h hands · c/k calibrate", font=self.f["xs"], fill=col("muted"))
-        return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+def draw_header(img, layer, t):
+    """Small band at the top of the camera picture: the map name and the year (or date) - nothing else."""
+    from PIL import Image, ImageDraw
+    f = L.get_fonts()
+    if layer.dynamic:
+        when = ("Date " if layer.has_dates else "Year ") + layer.time_label(t)
+    else:
+        when = layer.time_label(None)
+    hb = 62
+    band = (img[:hb].astype(np.float32) * 0.35).astype(np.uint8)          # darkened strip under the text
+    pil = Image.fromarray(cv2.cvtColor(band, cv2.COLOR_BGR2RGB))
+    d = ImageDraw.Draw(pil)
+    d.text((14, 8), layer.title, font=f["l"], fill=(255, 255, 255))
+    d.text((14, 33), when, font=f["s"], fill=(225, 225, 225))
+    img[:hb] = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+    return img
 
 
 # ----------------------------------------------------------------------------
@@ -1230,7 +1126,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     last_spoken = ""
     if voice.enabled:
         print(f"Voice: {voice.voice}. Hold still for 3 s to hear the place, time and value (v - off, r - repeat).")
-    panel, view = Panel(340), L.LayerView()
+    view = L.LayerView()
     names = [s.name for s in specs]
     li = names.index(args.layer) if args.layer in names else 0
     layer = specs[li].load()
@@ -1272,6 +1168,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     cv2.namedWindow(WIN_CAM, cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow(WIN_SST, cv2.WINDOW_NORMAL)
     placed = False
+    result = "quit"
     smooth, last_seen = None, 0.0
     fix = Fixation(args.dwell, args.radius * max(frame.shape[1], frame.shape[0]))
     spin, spin_speed = SpinMeter(), 0.0        # globe rotation speed (°/s)
@@ -1454,10 +1351,8 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             globe.overlay.draw(frame, tracker.status)
 
         cam = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        ph = max(cam.shape[0], 700)
-        if cam.shape[0] < ph:                                  # the panel is taller than the camera picture -> pad with background
-            cam = np.vstack([cam, np.full((ph - cam.shape[0], cam.shape[1], 3), (251, 252, 252), np.uint8)])
-        cv2.imshow(WIN_CAM, np.hstack([cam, panel.render(ph, info)]))
+        cv2.imshow(WIN_CAM, draw_header(cam, layer, t))       # only the map name and the year on top
+        ph = cam.shape[0]
         label = None if s is None else (layer.missing_label if s["missing"] else s["text"])
         pos = (lat, lon) if lat is not None else None
         map_img = view.render(layer, t, pos, trail, frac if pos is not None else 0.0, label)
@@ -1470,6 +1365,10 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
+            break
+        if key in (ord("b"), 8, 127, 27):                      # b / Backspace / Esc: back to the start menu
+            result = "menu"
+            print("Back to the start menu")
             break
         if key == ord("m"):
             print("Sound off" if son.toggle_mute() else "Sound on")
@@ -1544,11 +1443,117 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             cal.save(CALIB_FILE)
             tracker = make_tracker(args.track, cal, frame.shape)
             tracker.locked = True
-    voice.stop()
+    voice.stop()                                               # the menu announces itself
     son.close()
     landmarker.close()
     if globe is not None and not drawn:
         GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)       # last pose + newly remembered sides
+    for win in (WIN_CAM, WIN_SST):
+        try:
+            cv2.destroyWindow(win)
+        except cv2.error:
+            pass
+    cv2.waitKey(1)
+    return result
+
+
+# ----------------------------------------------------------------------------
+# Start menu: choose the surface (virtual map / paper map / physical globe / virtual globe)
+# ----------------------------------------------------------------------------
+WIN_MENU = "Earth Jukebox"
+MENU_W, MENU_H = 560, 400
+# (surface, title on screen, what it needs - only for the voice) - in the order shown and spoken
+MENU = [
+    ("vmap", "Virtual map", "just the camera"),
+    ("map", "Paper map", "a printed world map on the table"),
+    ("globe", "Physical globe", "a globe on a stand with blue oceans"),
+    ("virtual", "Virtual globe", "just the camera"),
+]
+
+
+def _menu_rows():
+    """Row rectangles (x0, y0, x1, y1) of the four options."""
+    top, row, pad = 40, 80, 30
+    return [(pad, top + k * row, MENU_W - pad, top + k * row + row - 10) for k in range(len(MENU))]
+
+
+def render_menu(selected):
+    """The menu picture (BGR): only the numbers and the option names. selected=None - nothing highlighted
+    (a row is tinted only after the arrow keys were used)."""
+    from PIL import Image, ImageDraw, ImageFont
+    from matplotlib import font_manager
+    bold = font_manager.findfont(font_manager.FontProperties(family="DejaVu Sans", weight="bold"))
+    font = ImageFont.truetype(bold, 34)
+    img = Image.new("RGB", (MENU_W, MENU_H), L.hex_rgb(SURFACE))
+    d = ImageDraw.Draw(img)
+    for k, ((_, title, _), (x0, y0, x1, y1)) in enumerate(zip(MENU, _menu_rows())):
+        if k == selected:
+            d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=L.hex_rgb("#dbe8f8"))
+        d.text((x0 + 22, y0 + 16), f"{k + 1}", font=font, fill=L.hex_rgb("#256abf" if k == selected else INK2))
+        d.text((x0 + 80, y0 + 16), title, font=font, fill=L.hex_rgb(INK))
+    return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+
+
+def menu_hit(x, y):
+    """Which option is at (x, y) in the menu picture; None if none."""
+    for k, (x0, y0, x1, y1) in enumerate(_menu_rows()):
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return k
+    return None
+
+
+def menu_announcement():
+    parts = ["Earth Jukebox, start menu. Choose how you want to explore the Earth."]
+    for k, (_, title, needs) in enumerate(MENU, 1):
+        parts.append(f"Press {k} for {title.lower()}, {needs}.")
+    parts.append("Use the arrow keys and Enter, or press Q to quit.")
+    return " ".join(parts)
+
+
+# arrow keys as returned by cv2.waitKeyEx (macOS, Windows, Linux)
+_UP = {63232, 2490368, 65362, 63234, 2424832, 65361}      # up or left
+_DOWN = {63233, 2621440, 65364, 63235, 2555904, 65363}    # down or right
+
+
+def choose_surface(args):
+    """Show the start menu, return the chosen surface ("vmap", "map", "globe", "virtual") or None to quit."""
+    voice = SP.Speaker(enabled=not args.no_voice, voice=args.voice, rate=args.voice_rate)
+    voice.speak(menu_announcement())
+    print("=== START MENU === " + "  ".join(f"{k}. {m[1]}" for k, m in enumerate(MENU, 1)) + "   (q - quit)")
+    selected, clicked = None, []                                # nothing highlighted until the arrows are used
+    cv2.namedWindow(WIN_MENU, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(WIN_MENU, lambda ev, x, y, *_: clicked.append(menu_hit(x, y))
+                         if ev == cv2.EVENT_LBUTTONDOWN else None)
+    try:
+        while True:
+            cv2.imshow(WIN_MENU, render_menu(selected))
+            key = cv2.waitKeyEx(30)
+            choice = None
+            if clicked:
+                choice = clicked.pop()
+            elif key in (ord("q"), 27):
+                voice.stop()
+                return None
+            elif 0 <= key < 256 and ord("1") <= key <= ord("0") + len(MENU):
+                choice = key - ord("1")
+            elif key in (13, 10, 32) and selected is not None:
+                choice = selected
+            elif key in _UP or key in _DOWN:
+                if selected is None:
+                    selected = 0 if key in _DOWN else len(MENU) - 1
+                else:
+                    selected = (selected + (1 if key in _DOWN else -1)) % len(MENU)
+                voice.speak(f"{selected + 1}, {MENU[selected][1]}.")       # say the highlighted option
+            if choice is not None:
+                surf, title = MENU[choice][0], MENU[choice][1]
+                print(f"Mode: {title}")
+                voice.speak(f"{title}.")
+                while voice.speaking():                                   # let it finish before the camera starts
+                    cv2.waitKey(20)
+                return surf
+    finally:
+        cv2.destroyWindow(WIN_MENU)
+        cv2.waitKey(1)
 
 
 # ----------------------------------------------------------------------------
@@ -2189,19 +2194,30 @@ def selftest(args):
         write_wav(out / fname, wav)
         print(f"   {title}: {len(wav) / sr:.0f} s, peak {np.abs(wav).max():.2f} {'OK' if ok else 'FAIL'} -> {fname}")
 
-    print("\n7) Rendering the panel and the window for every layer:")
-    view, panel = L.LayerView(), Panel(340)
+    print("\n6b) Start menu:")
+    rows = _menu_rows()
+    hits = [menu_hit((x0 + x1) / 2, (y0 + y1) / 2) for x0, y0, x1, y1 in rows]
+    ok_mh = hits == [0, 1, 2, 3] and menu_hit(2, 2) is None
+    ann_m = menu_announcement()
+    ok_ma = all(f"Press {k} for {m[1].lower()}" in ann_m for k, m in enumerate(MENU, 1))
+    order = [m[1] for m in MENU]
+    ok_mo = order == ["Virtual map", "Paper map", "Physical globe", "Virtual globe"]
+    ok_kb = all(any(k_[0] == "b" for k_ in ks) for ks in (KEYS, KEYS_GLOBE, KEYS_VIRTUAL, KEYS_VMAP))
+    cv2.imwrite(str(out / "selftest_menu.png"), render_menu(None))
+    print(f"   options {order}; clicks on rows -> {hits}; announcement names all 4; "
+          f"'b' = back to the menu in every mode {'OK' if ok_mh and ok_ma and ok_mo and ok_kb else 'FAIL'}")
+    ok_all &= ok_mh and ok_ma and ok_mo and ok_kb
+
+    print("\n7) Rendering the header and the window for every layer:")
+    view = L.LayerView()
     for k, s in enumerate(specs, 1):
         lay = by[s.name]
         y = lay.default_frame()
         smp = lay.sample(35.0, -70.0, y)                         # Gulf Stream: data in every ocean layer
         trail = [(30 + q * 0.6, -80 + q) for q in range(15)]
         cv2.imwrite(str(out / f"selftest_view_{s.name}.png"), view.render(lay, y, (35.0, -70.0), trail, 0.6, smp["text"]))
-        cv2.imwrite(str(out / f"selftest_panel_{s.name}.png"), panel.render(700, {
-            "layer": lay, "layer_idx": k, "n_layers": len(specs), "t": y, "playing": False, "state": "ok",
-            "pos": (35.0, -70.0), "sample": smp, "sheet": "tracked", "inliers": 640, "dwell": 0.6,
-            "note": None if smp["missing"] else midi_name(norm_to_midi(smp["norm"])),
-            "last_fix": report(lay, y, 35.0, -70.0, smp)}))
+        cv2.imwrite(str(out / f"selftest_header_{s.name}.png"),
+                    draw_header(np.full((484, 860, 3), 120, np.uint8), lay, y))
     cv2.imwrite(str(out / "selftest_sheet.png"), cv2.polylines(hand, [np.int32(tracker.corners)], True, (0, 200, 0), 3))
     print(f"   saved to {out}/")
     print("\nSELFTEST", "PASSED" if ok_all else "FAILED")
@@ -2209,6 +2225,31 @@ def selftest(args):
 
 # ----------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
+def run_session(cap, specs, args, scale, frame, surface):
+    """One session in the chosen mode (calibration if needed + tracking). -> "menu" or "quit"."""
+    if surface == "vmap":                                      # nothing to calibrate: the map is drawn
+        return run_tracking(cap, None, specs, args, scale, globe=VM.VirtualMap((frame.shape[1], frame.shape[0])))
+    if surface == "virtual":                                   # nothing to calibrate: the globe is drawn
+        return run_tracking(cap, None, specs, args, scale, globe=GB.VirtualGlobe((frame.shape[1], frame.shape[0])))
+    if surface == "globe":
+        loaded = None if args.recalibrate else GB.load_globe()
+        if loaded and tuple(loaded[0].geom.to_dict()["frame_wh"]) != (frame.shape[1], frame.shape[0]):
+            print("The camera frame size changed since the globe calibration - recalibration needed.")
+            loaded = None
+        if loaded:
+            print(f"Globe calibration from {GB.GLOBE_CALIB.name}. (--recalibrate to redo it)")
+        globe = GlobeSurface(*loaded) if loaded else run_globe_calibration(cap, args, scale)
+        return run_tracking(cap, None, specs, args, scale, globe=globe)
+    cal = MapCalibration.load(CALIB_FILE) if CALIB_FILE.exists() and not args.recalibrate else None
+    if cal is None:
+        if CALIB_FILE.exists() and not args.recalibrate:
+            print("Old calibration.json format (no map template), recalibration needed.")
+        cal = run_calibration(cap, args, scale)
+    else:
+        print(f"Calibration from {CALIB_FILE.name}: projection {cal.proj}. (--recalibrate to redo it)")
+    return run_tracking(cap, cal, specs, args, scale)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", type=int, default=0, help="camera index (0 - built-in)")
@@ -2225,8 +2266,8 @@ def main():
     ap.add_argument("--projection", default="equirect", choices=PROJECTIONS,
                     help="projection, if only 4 places were clicked")
     ap.add_argument("--lon0", type=float, default=0.0, help="central meridian of the map, if only 4 places")
-    ap.add_argument("--surface", default="map", choices=["map", "globe", "virtual", "vmap"],
-                    help="map - paper map (as before), globe - globe on a stand with an axis, "
+    ap.add_argument("--surface", default=None, choices=["map", "globe", "virtual", "vmap"],
+                    help="skip the start menu: map - paper map, globe - globe on a stand with an axis, "
                          "virtual - virtual globe over the camera picture (rotated with a left-hand pinch), "
                          "vmap - virtual flat map over the camera picture (left thumb+index spread = zoom)")
     ap.add_argument("--track", default="features", choices=["features", "contour", "static"],
@@ -2263,30 +2304,16 @@ def main():
     try:
         frame = _read(cap)
         scale = min(1.0, args.view / frame.shape[1])
-        if args.surface == "vmap":                             # nothing to calibrate: the map is drawn
-            run_tracking(cap, None, specs, args, scale, globe=VM.VirtualMap((frame.shape[1], frame.shape[0])))
-            return
-        if args.surface == "virtual":                          # nothing to calibrate: the globe is drawn
-            run_tracking(cap, None, specs, args, scale, globe=GB.VirtualGlobe((frame.shape[1], frame.shape[0])))
-            return
-        if args.surface == "globe":
-            loaded = None if args.recalibrate else GB.load_globe()
-            if loaded and tuple(loaded[0].geom.to_dict()["frame_wh"]) != (frame.shape[1], frame.shape[0]):
-                print("The camera frame size changed since the globe calibration - recalibration needed.")
-                loaded = None
-            if loaded:
-                print(f"Globe calibration from {GB.GLOBE_CALIB.name}. (--recalibrate to redo it)")
-            globe = GlobeSurface(*loaded) if loaded else run_globe_calibration(cap, args, scale)
-            run_tracking(cap, None, specs, args, scale, globe=globe)
-            return
-        cal = MapCalibration.load(CALIB_FILE) if CALIB_FILE.exists() and not args.recalibrate else None
-        if cal is None:
-            if CALIB_FILE.exists() and not args.recalibrate:
-                print("Old calibration.json format (no map template), recalibration needed.")
-            cal = run_calibration(cap, args, scale)
-        else:
-            print(f"Calibration from {CALIB_FILE.name}: projection {cal.proj}. (--recalibrate to redo it)")
-        run_tracking(cap, cal, specs, args, scale)
+        surface = args.surface                                 # --surface skips the menu the first time
+        while True:
+            if surface is None:                                # start menu: choose the mode
+                surface = choose_surface(args)
+                if surface is None:
+                    return
+            if run_session(cap, specs, args, scale, frame, surface) != "menu":
+                return
+            surface = None                                     # b / Backspace / Esc -> back to the menu
+            args.recalibrate = False                           # recalibrate at most once per start
     finally:
         cap.release()
         cv2.destroyAllWindows()
