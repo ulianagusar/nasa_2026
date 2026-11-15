@@ -66,7 +66,7 @@ KEYS = [
     ("p", "the P key", "play through time; press again to pause"),
     ("r", "the R key", "repeat the last message"),
     ("m", "the M key", "sound on or off"),
-    ("v", "the V key", "voice on or off"),
+    ("v", "the V key", "spoken messages on or off; the sounds stay"),
     ("h", "the H key", "swap hands if the program mixes them up"),
     ("c", "the C key", "recalibrate the map"),
     ("k", "the K key", "mark the map corners again"),
@@ -81,6 +81,7 @@ KEYS_VMAP = [k for k in KEYS if k[0] not in ("c", "k")] + [
 ]
 KEYS_VIRTUAL = [k for k in KEYS if k[0] not in ("c", "k")] + [
     ("n", "the N key", "turn the globe north up"),
+    ("f", "the F key", "free rotation, or fix the poles again so the globe turns like on a stand"),
     ("+ -", "plus and minus", "make the globe bigger or smaller"),
 ]
 # Globe: no left-hand time control, so "comma/period/p" are the main time controls; c/k mean something else.
@@ -819,7 +820,23 @@ def report(layer, t, lat, lon, s):
     return f"{head} -> {s['text']}" + (" | " + " | ".join(extra) if extra else "")
 
 
-def draw_header(img, layer, t):
+def toggle_voice(voice, args):
+    """v key / menu item: spoken messages on or off (sound effects are not touched). The choice is kept in
+    args.no_voice, so it stays for the menu and the next sessions. -> the (new) Speaker."""
+    if voice.enabled:
+        voice.stop()
+        voice.enabled = False
+        args.no_voice = True
+        print("Voice off (sounds stay on)")
+        return voice
+    voice = SP.Speaker(enabled=True, voice=args.voice, rate=args.voice_rate)
+    args.no_voice = not voice.enabled
+    print("Voice on" if voice.enabled else "Voice not available")
+    voice.speak("Voice on.")
+    return voice
+
+
+def draw_header(img, layer, t, voice_on=True):
     """Small band at the top of the camera picture: the map name and the year (or date) - nothing else."""
     from PIL import Image, ImageDraw
     f = L.get_fonts()
@@ -833,6 +850,9 @@ def draw_header(img, layer, t):
     d = ImageDraw.Draw(pil)
     d.text((14, 8), layer.title, font=f["l"], fill=(255, 255, 255))
     d.text((14, 33), when, font=f["s"], fill=(225, 225, 225))
+    if not voice_on:                                                       # only when it is off
+        txt = "voice off"
+        d.text((img.shape[1] - 14 - d.textlength(txt, font=f["s"]), 33), txt, font=f["s"], fill=(225, 225, 225))
     img[:hb] = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
     return img
 
@@ -1254,6 +1274,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
         print("   Virtual globe over the camera picture (mirrored, like a video call).")
         print("   RIGHT index finger: point at the globe.")
         print("   LEFT hand: pinch thumb and index finger and move to turn the globe; open the fingers to let go.")
+        print("   The poles stay fixed (like a globe on a stand): sideways = spin, up/down = tilt; f = free rotation.")
         print("   Time - keys: , . (step), < > (10 steps), p (play).")
     else:
         print("   RIGHT index finger: point at the globe. You can spin, move and tilt the globe:")
@@ -1448,7 +1469,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             globe.overlay.draw(frame, tracker.status)
 
         cam = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        cv2.imshow(WIN_CAM, draw_header(cam, layer, t))       # only the map name and the year on top
+        cv2.imshow(WIN_CAM, draw_header(cam, layer, t, voice.enabled))       # only the map name and the year on top
         ph = cam.shape[0]
         label = None if s is None else (layer.missing_label if s["missing"] else s["text"])
         pos = (lat, lon) if lat is not None else None
@@ -1470,13 +1491,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
         if key == ord("m"):
             print("Sound off" if son.toggle_mute() else "Sound on")
         if key == ord("v"):
-            if voice.enabled:
-                voice.stop()
-                voice.enabled = False
-                print("Voice off")
-            elif not args.no_voice or voice.voice:
-                voice = SP.Speaker(enabled=True, voice=args.voice, rate=args.voice_rate)
-                print("Voice on" if voice.enabled else "Voice not available")
+            voice = toggle_voice(voice, args)
         if key == ord("r") and last_spoken and voice.enabled:
             voice.speak(last_spoken)
         if key == ord("i"):
@@ -1502,6 +1517,9 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 print("Playback: " + ("▶" if playing else "paused"))
         if virtual and key == ord("n"):
             globe.north_up()
+        if virtual and key == ord("f"):
+            globe.set_polar(not globe.polar)
+            print("Globe: poles fixed (turns like on a stand)" if globe.polar else "Globe: free rotation")
         if virtual and key in (ord("+"), ord("=")):
             globe.resize(1.1)
         if virtual and key in (ord("-"), ord("_")):
@@ -1558,7 +1576,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 # Start menu: choose the surface (virtual map / paper map / physical globe / virtual globe)
 # ----------------------------------------------------------------------------
 WIN_MENU = "Earth Jukebox"
-MENU_W, MENU_H = 640, 630
+MENU_W, MENU_H = 640, 710
 # (surface or action, title on screen, extra words only for the voice) - in the order shown and spoken
 MENU = [
     ("vmap", "Virtual map", "just the camera"),
@@ -1568,6 +1586,7 @@ MENU = [
     ("reset", "Reset calibration", "of the paper map and the physical globe"),
     ("camera", "Camera", ""),
     ("import", "Add a map from a video", "or a picture: it becomes a new data layer"),
+    ("voice", "Voice", ""),
 ]
 CALIB_BACKUP = HERE / ".calibration_backup"
 
@@ -1639,7 +1658,7 @@ def _menu_rows():
     return [(pad, top + k * row, MENU_W - pad, top + k * row + row - 10) for k in range(len(MENU))]
 
 
-def render_menu(selected, camera_name=None):
+def render_menu(selected, camera_name=None, voice_on=True):
     """The menu picture (BGR): only the numbers and the option names. selected=None - nothing highlighted
     (a row is tinted only after the arrow keys were used)."""
     from PIL import Image, ImageDraw, ImageFont
@@ -1653,6 +1672,8 @@ def render_menu(selected, camera_name=None):
             title = f"Camera: {camera_name}"
             while d.textlength(title, font=font) > (x1 - x0) - 100:   # long names: shorten to fit the row
                 title = title[:-2].rstrip() + "…" if not title.endswith("…") else title[:-2] + "…"
+        if what == "voice":
+            title = "Voice: " + ("on" if voice_on else "off")
         if k == selected:
             d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=L.hex_rgb("#dbe8f8"))
         d.text((x0 + 22, y0 + 16), f"{k + 1}", font=font, fill=L.hex_rgb("#256abf" if k == selected else INK2))
@@ -1677,6 +1698,8 @@ def menu_announcement(camera_name=None):
             parts.append(f"Press {k} to choose the camera" + (f"; now: {camera_name}." if camera_name else "."))
         elif what == "import":
             parts.append(f"Press {k} to add a map from a video or a picture.")
+        elif what == "voice":
+            parts.append(f"Press {k} or V to turn the voice off; the sounds stay.")
         else:
             parts.append(f"Press {k} for {title.lower()}, {needs}.")
     parts.append("Use the arrow keys and Enter, or press Q to quit.")
@@ -1700,7 +1723,7 @@ def choose_surface(args, camera_name=None):
                          if ev == cv2.EVENT_LBUTTONDOWN else None)
     try:
         while True:
-            cv2.imshow(WIN_MENU, render_menu(selected, camera_name))
+            cv2.imshow(WIN_MENU, render_menu(selected, camera_name, voice.enabled))
             key = cv2.waitKeyEx(30)
             choice = None
             if clicked:
@@ -1708,6 +1731,8 @@ def choose_surface(args, camera_name=None):
             elif key in (ord("q"), 27):
                 voice.stop()
                 return None
+            elif key == ord("v"):
+                choice = next(k for k, m in enumerate(MENU) if m[0] == "voice")
             elif 0 <= key < 256 and ord("1") <= key <= ord("0") + len(MENU):
                 choice = key - ord("1")
             elif key in (13, 10, 32) and selected is not None:
@@ -1718,7 +1743,12 @@ def choose_surface(args, camera_name=None):
                 else:
                     selected = (selected + (1 if key in _DOWN else -1)) % len(MENU)
                 spoken = f"Camera: {camera_name}" if MENU[selected][0] == "camera" and camera_name else MENU[selected][1]
+                if MENU[selected][0] == "voice":
+                    spoken = "Voice: on"                              # (when it is off, nothing is spoken)
                 voice.speak(f"{selected + 1}, {spoken}.")                 # say the highlighted option
+            if choice is not None and MENU[choice][0] == "voice":    # an action, not a mode
+                voice = toggle_voice(voice, args)
+                continue
             if choice is not None and MENU[choice][0] == "reset":    # an action, not a mode
                 voice.stop()
                 confirm_reset(voice)
@@ -2286,17 +2316,38 @@ def selftest(args):
     rt_ = vg.to_latlon(vg.u0 + vg.r * 0.5, vg.v0)
     ok_v = abs(c_[0] - 20) < 1e-6 and abs(c_[1] - 15) < 1e-6 and up_[0] > c_[0] and rt_[1] > c_[1]
     print(f"   centre {c_[0]:.0f}°N {c_[1]:.0f}°E; above -> further north, right -> further east {'OK' if ok_v else 'FAIL'}")
+    vg.set_polar(False)                                          # free trackball
     left_ = vg.to_latlon(vg.u0 - vg.r * 0.5, vg.v0)
     vg.rotate_drag(vg.r * np.arcsin(0.5), 0)
     c2_ = vg.to_latlon(vg.u0, vg.v0)
     ok_d = abs(c2_[0] - left_[0]) < 0.1 and abs(c2_[1] - left_[1]) < 0.1
-    print(f"   dragging right: what was on the left is now in the centre {'OK' if ok_d else 'FAIL'}")
-    vg.north_up()
+    print(f"   free rotation, dragging right: what was on the left is now in the centre {'OK' if ok_d else 'FAIL'}")
+    vg.set_polar(True)                                           # fixed poles (the default)
+    ok_pl = GB.VirtualGlobe((1280, 720)).polar and abs(vg.to_latlon(vg.u0, vg.v0)[1] - c2_[1]) < 0.1
+    rgp = np.random.default_rng(3)
+    axis_dev, lat_before = 0.0, vg.lat_c
+    vg.rotate_drag(vg.r * 0.7, 0)                                # sideways: only the longitude changes
+    ok_pl &= abs(vg.lat_c - lat_before) < 1e-9 and abs(vg.to_latlon(vg.u0, vg.v0)[0] - lat_before) < 0.1
+    for _ in range(200):                                         # any hand movement: the axis stays vertical
+        vg.rotate_drag(*rgp.normal(0, 60, 2))
+        for pole in ((0, 0, 1.0), (0, 0, -1.0)):
+            x_, y_, vis_ = vg.project(np.array([pole]))
+            if vis_[0]:
+                axis_dev = max(axis_dev, abs(x_[0] - vg.u0))
+    vg.rotate_drag(0, vg.r * 5)                                  # far down: stops with the North Pole in the centre
+    at_np = vg.lat_c == 90 and vg.to_latlon(vg.u0, vg.v0)[0] > 89.9
+    up_np = vg.to_latlon(vg.u0, vg.v0 - vg.r * 0.5)[0]
+    vg.rotate_drag(vg.r * 0.5, 0)                                # spinning while looking at the pole
+    ok_pl &= axis_dev < 1e-6 and at_np and vg.to_latlon(vg.u0, vg.v0)[0] > 89.9 and up_np < 89
+    print(f"   fixed poles (default): sideways = spin, up/down = tilt, the axis never leans "
+          f"(max {axis_dev:.1e} px off vertical), tilt stops at the pole {'OK' if ok_pl else 'FAIL'}")
+    ok_d &= ok_pl
+    vg.reset()
 
-    def vhand(pinch, cx):
-        pts = [NS(x=cx / 1280, y=0.7) for _ in range(21)]
-        pts[0] = NS(x=cx / 1280, y=0.85); pts[9] = NS(x=cx / 1280, y=0.70)
-        pts[4] = NS(x=(cx - (5 if pinch else 60)) / 1280, y=0.6); pts[8] = NS(x=(cx + (5 if pinch else 60)) / 1280, y=0.6)
+    def vhand(pinch, cx, y=0.6):
+        pts = [NS(x=cx / 1280, y=y + 0.1) for _ in range(21)]
+        pts[0] = NS(x=cx / 1280, y=y + 0.25); pts[9] = NS(x=cx / 1280, y=y + 0.10)
+        pts[4] = NS(x=(cx - (5 if pinch else 60)) / 1280, y=y); pts[8] = NS(x=(cx + (5 if pinch else 60)) / 1280, y=y)
         return pts
     l0 = vg.to_latlon(vg.u0, vg.v0)[1]
     for k_ in range(10):
@@ -2311,6 +2362,22 @@ def selftest(args):
     l3 = vg.to_latlon(vg.u0, vg.v0)[1]
     ok_p = abs(l1 - l0) < 1e-6 and l2 < l1 - 20 and l3 < l2 - 5
     print(f"   no rotation without a pinch; pinch and move -> {l1:.0f}° -> {l2:.0f}°; inertia -> {l3:.0f}° {'OK' if ok_p else 'FAIL'}")
+    lat_s, lon_0 = vg.lat_c, vg.lon_c                            # a pinch that drifts a little up/down: spin only
+    for k_ in range(15):
+        vg.handle_left(vhand(True, 300 + 20 * k_, 0.6 + 0.004 * k_), 1280, 720, 10 + k_ * 0.033)
+    lon_s = vg.lon_c
+    spin_ok = vg.lock == "spin" and vg.lat_c == lat_s and abs(lon_s - lon_0) > 10
+    vg.vel[:] = 0                                                # no inertia between the two pinches
+    vg.handle_left(None, 1280, 720, 11)
+    lon_s = vg.lon_c
+    for k_ in range(15):                                         # a clearly vertical pinch: tilt only
+        vg.handle_left(vhand(True, 500 + 2 * k_, 0.4 + 0.02 * k_), 1280, 720, 12 + k_ * 0.033)
+    tilt_ok = vg.lock == "tilt" and abs(vg.lon_c - lon_s) < 1e-9 and vg.lat_c > lat_s + 10
+    print(f"   each pinch locks to one direction: a slightly slanted sideways move only spins (tilt unchanged), "
+          f"a vertical move only tilts {'OK' if spin_ok and tilt_ok else 'FAIL'}")
+    ok_d &= spin_ok and tilt_ok
+    vg.reset()
+    vg.handle_left(None, 1280, 720, 13)
     two = NS(hand_landmarks=[[NS(x=x_, y=0.5)] * 21 for x_ in (0.2, 0.7)],
              handedness=[[NS(category_name=c_, score=0.9)] for c_ in ("Left", "Right")])
     r_m = hand_roles(two, swap=True)                            # mirrored frame: labels are not swapped
@@ -2324,7 +2391,7 @@ def selftest(args):
     dt_v = (time.perf_counter() - t0_) / 5 * 1000
     cv2.imwrite(str(out / "selftest_virtual_globe.png"), f_)
     hv = SP.help_announcement(KEYS_VIRTUAL, len(specs), "virtual")
-    ok_hv = "thumb and index finger" in hv and "The N key" in hv
+    ok_hv = "thumb and index finger" in hv and "The N key" in hv and "The F key" in hv and "poles stay" in hv
     print(f"   drawing {dt_v:.0f} ms/frame; help mentions the pinch and the n key {'OK' if ok_hv else 'FAIL'}")
     ok_all &= ok_v and ok_d and ok_p and ok_r and ok_hv
 
@@ -2557,7 +2624,8 @@ def selftest(args):
         and "Press 5 to reset the calibration" in ann_m
     order = [m[1] for m in MENU]
     ok_mo = order == ["Virtual map", "Paper map", "Physical globe", "Virtual globe", "Reset calibration", "Camera",
-                      "Add a map from a video"] and "Press 7 to add a map" in ann_m
+                      "Add a map from a video", "Voice"] and "Press 7 to add a map" in ann_m \
+        and "Press 8 or V to turn the voice off" in ann_m
     # cameras: English labels, phone / external camera preferred, names from macOS (no camera is opened here)
     lab = [camera_label("Камера FaceTime HD", "AVCaptureDeviceTypeBuiltInWideAngleCamera"),
            camera_label("Телефон Уляни", "AVCaptureDeviceTypeContinuityCamera"),
@@ -2589,6 +2657,21 @@ def selftest(args):
     ok_mh &= ok_rs
     ok_kb = all(any(k_[0] == "b" for k_ in ks) for ks in (KEYS, KEYS_GLOBE, KEYS_VIRTUAL, KEYS_VMAP))
     cv2.imwrite(str(out / "selftest_menu.png"), render_menu(None, "iPhone"))
+    cv2.imwrite(str(out / "selftest_menu_voice_off.png"), render_menu(None, "iPhone", voice_on=False))
+    # voice toggle: off -> the choice is kept in args (menu + next sessions), sound effects are not touched
+    from types import SimpleNamespace as _NS
+    a_ = _NS(no_voice=False, voice="auto", voice_rate=175)
+    v_ = SP.Speaker(enabled=True)
+    v_ = toggle_voice(v_, a_)
+    off_ok = not v_.enabled and a_.no_voice
+    v_ = toggle_voice(v_, a_); v_.stop()
+    on_ok = v_.enabled == (not a_.no_voice) and (v_.enabled or not SP.english_voices())
+    ok_vk = all(any(k_[0] == "v" for k_ in ks) for ks in (KEYS, KEYS_GLOBE, KEYS_VIRTUAL, KEYS_VMAP))
+    cv2.imwrite(str(out / "selftest_header_voice_off.png"),
+                draw_header(np.full((200, 860, 3), 120, np.uint8), next(iter(by.values())), None, voice_on=False))
+    print(f"   voice toggle: off -> kept for the menu and the next session, on again -> {v_.voice}; "
+          f"'v' in every mode; 'voice off' in the header {'OK' if off_ok and on_ok and ok_vk else 'FAIL'}")
+    ok_mo &= off_ok and on_ok and ok_vk
     print(f"   options {order}; clicks on rows -> {hits}; announcement names all 4; "
           f"'b' = back to the menu in every mode {'OK' if ok_mh and ok_ma and ok_mo and ok_kb else 'FAIL'}")
     ok_all &= ok_mh and ok_ma and ok_mo and ok_kb

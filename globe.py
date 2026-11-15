@@ -523,12 +523,18 @@ def _rodrigues(axis_angle):
 class VirtualGlobe:
     """A globe that does not physically exist: a sphere with the layer data is drawn over the (mirrored) camera frame.
     The right hand points at it, the left hand rotates it: pinch (thumb + index) and move = trackball, with inertia.
-    View coordinates: X right, U up, Z towards the viewer; v = R g (g - point in globe coordinates)."""
+    View coordinates: X right, U up, Z towards the viewer; v = R g (g - point in globe coordinates).
+    polar=True (default): the poles stay fixed like on a globe stand - the axis never leans sideways. Each pinch
+    is locked to one direction, decided by the first LOCK_PX pixels: sideways = only spin around the axis (the
+    tilt does not change at all), clearly up/down = only tilt (up to looking straight at a pole).
+    polar=False: free trackball (any rotation)."""
     status, mode, inliers, score = "tracked", "virtual", 0, 1.0
     PINCH_ON, PINCH_OFF = 0.33, 0.5          # thumb-index distance / palm size
+    LOCK_PX, TILT_RATIO = 25.0, 2.0          # fixed poles: movement before the direction is decided; how vertical = tilt
 
-    def __init__(self, frame_wh, radius_frac=0.42, lat0=20.0, lon0=15.0, step=2):
+    def __init__(self, frame_wh, radius_frac=0.42, lat0=20.0, lon0=15.0, step=2, polar=True):
         self.W, self.H = int(frame_wh[0]), int(frame_wh[1])
+        self.polar = polar
         self.u0, self.v0 = self.W * 0.5, self.H * 0.52
         self.r = self.H * radius_frac
         self.step = step
@@ -545,24 +551,43 @@ class VirtualGlobe:
         self.grat = grat
         self.pinching, self.last_pt, self.pinch_pt, self.last_t = False, None, None, None
         self.vel = np.zeros(2)                                   # drag speed (px/s) for inertia
+        self.lock, self.acc = None, np.zeros(2)                  # fixed poles: "spin" or "tilt" for this pinch
         self._grid = None
 
     # --- orientation ---
     def reset(self, lat0=20.0, lon0=15.0):
         """Point (lat0, lon0) in the centre, north up."""
-        fwd = latlon_to_vec(lat0, lon0)
-        north = np.array([0, 0, 1.0])
-        up = north - fwd * (north @ fwd); up /= np.linalg.norm(up)
-        self.R = np.stack([np.cross(up, fwd), up, fwd])
+        self.lat_c = float(np.clip(lat0, -90.0, 90.0))
+        self.lon_c = float((lon0 + 180.0) % 360.0 - 180.0)
+        self._set_view()
         self.vel = np.zeros(2)
+
+    def _set_view(self):
+        """R from the centre point (lat_c, lon_c) with north up. "Up" = the direction of growing latitude,
+        which stays defined at the poles too (there it points across the pole)."""
+        la, lo = np.radians(self.lat_c), np.radians(self.lon_c)
+        fwd = latlon_to_vec(self.lat_c, self.lon_c)
+        up = np.array([-np.sin(la) * np.cos(lo), -np.sin(la) * np.sin(lo), np.cos(la)])
+        self.R = np.stack([np.cross(up, fwd), up, fwd])
 
     def north_up(self):
         """Turn north up without changing the place in the centre."""
         lat, lon, _, _ = self.to_latlon(self.u0, self.v0)
         self.reset(lat, lon)
 
+    def set_polar(self, on):
+        """Switch between the fixed-poles mode and the free trackball; the place in the centre stays."""
+        self.polar = bool(on)
+        if self.polar:
+            self.north_up()
+
     def rotate_drag(self, dx, dy):
-        """Drag by (dx, dy) pixels: the surface follows the hand (trackball)."""
+        """Drag by (dx, dy) pixels: the surface follows the hand."""
+        if self.polar:                    # sideways = spin around the axis, up/down = tilt; poles stay put
+            self.lon_c = float((self.lon_c - np.degrees(dx / self.r) + 180.0) % 360.0 - 180.0)
+            self.lat_c = float(np.clip(self.lat_c + np.degrees(dy / self.r), -90.0, 90.0))
+            self._set_view()
+            return
         d = np.array([dx, -dy], float) / self.r
         ang = float(np.linalg.norm(d))
         if ang < 1e-6:
@@ -601,8 +626,12 @@ class VirtualGlobe:
             self.pinching = pd < (self.PINCH_OFF if self.pinching else self.PINCH_ON)
             self.pinch_pt = (p(4) + p(8)) / 2
             if self.pinching:
-                if self.last_pt is not None:
+                if self.last_pt is None:                         # a new pinch: direction not decided yet
+                    self.lock, self.acc = None, np.zeros(2)
+                else:
                     delta = self.pinch_pt - self.last_pt
+                    if self.polar:
+                        delta = self._locked(delta)
                     self.rotate_drag(*delta)
                     if dt > 0:
                         self.vel = 0.6 * self.vel + 0.4 * delta / dt
@@ -614,6 +643,16 @@ class VirtualGlobe:
             self.vel *= np.exp(-dt / 0.6)
         elif dt > 0:
             self.vel[:] = 0
+
+    def _locked(self, delta):
+        """Fixed poles: keep only the spin (x) or only the tilt (y) part of the hand movement."""
+        if self.lock is None:
+            self.acc = self.acc + delta
+            if np.linalg.norm(self.acc) < self.LOCK_PX:
+                return np.zeros(2)                               # wait until the direction is clear
+            self.lock = "tilt" if abs(self.acc[1]) > self.TILT_RATIO * abs(self.acc[0]) else "spin"
+            delta = self.acc                                     # apply the movement made so far
+        return np.array([delta[0], 0.0]) if self.lock == "spin" else np.array([0.0, delta[1]])
 
     # --- drawing ---
     def _disc(self):
@@ -680,7 +719,9 @@ class VirtualGlobe:
             c = tuple(int(v) for v in self.pinch_pt)
             col = (191, 106, 37) if self.pinching else (160, 160, 160)
             cv2.circle(frame, c, 14 if self.pinching else 9, col, -1 if self.pinching else 2, cv2.LINE_AA)
-            cv2.putText(frame, "ROTATE" if self.pinching else "pinch to rotate", (c[0] + 16, c[1] - 12),
+            word = ("SPIN" if self.lock == "spin" else "TILT" if self.lock == "tilt" else "ROTATE") \
+                if self.polar else "ROTATE"
+            cv2.putText(frame, word if self.pinching else "pinch to rotate", (c[0] + 16, c[1] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
 
 

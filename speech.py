@@ -336,6 +336,8 @@ def help_announcement(keys, n_layers, surface="map"):
                  "Point at it with the index finger of your right hand. " + _SOUND_EXPLAINED + " "
                  "To turn the globe, pinch your left thumb and index finger together, as if you were holding it, "
                  "and move your hand. Open your fingers to let go. "
+                 "The poles stay in place, like on a globe stand: move sideways to spin it, "
+                 "up or down to tilt it towards a pole. "
                  "Hold your right finger still for three seconds, and I will tell you the place, the time, "
                  "and the value. Change the time with the comma and period keys.")
     elif surface == "globe":

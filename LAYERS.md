@@ -156,6 +156,8 @@ the `title` without the explanation in brackets. The place is found offline from
 outlines (`data/ne_50m_*.geojson`, downloaded automatically) - see [speech.py](speech.py).
 The voice is the best installed English macOS voice (Premium/Enhanced voices are picked first);
 choose another one with `--voice Daniel`.
+The `v` key (or menu item **8. Voice**) turns the spoken messages off and on; the sounds and the chime stay.
+The choice is kept for the menu and the next sessions; `--no-voice` starts with the voice off.
 
 ## How a layer becomes sound
 
