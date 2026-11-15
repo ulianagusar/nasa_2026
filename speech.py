@@ -2,7 +2,7 @@
 
     geo = Geocoder()                          # offline, Natural Earth outlines with English names
     text = compose(layer, t, lat, lon, sample, geo.locate(lat, lon))
-    Speaker().speak(text)                     # macOS `say`, best installed English voice
+    Speaker().speak(text)                     # Kokoro neural voice (offline), else macOS `say`
 
 Example: "Central Ethiopia. Eastern Africa. Natural region: Ethiopian Highlands. Year 2025.
 Temperature anomaly: plus 1.28 degrees. This is the departure from the 1951 to 1980 average."
@@ -15,6 +15,8 @@ import json
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -382,14 +384,147 @@ def english_voices():
     return sorted(voices, key=rank)
 
 
+# ----------------------------------------------------------------------------
+# Neural voice: Kokoro (82M parameters, Apache 2.0, runs offline on the CPU, ~3x faster than real time on an M2).
+# Model files (not in git): models/kokoro-v1.0.onnx, models/voices-v1.0.bin - `python speech.py --download`.
+# ----------------------------------------------------------------------------
+KOKORO_MODEL = HERE / "models" / "kokoro-v1.0.onnx"
+KOKORO_VOICES = HERE / "models" / "voices-v1.0.bin"
+KOKORO_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+KOKORO_DEFAULT = "af_heart"          # the best rated English voice of Kokoro v1.0
+TTS_CACHE = HERE / ".tts_cache"      # sentences already spoken (menu, help, layer names) play at once
+_KOKORO_NAME = re.compile(r"^[ab][fm]_[a-z]+$")
+
+
+def is_kokoro_voice(name):
+    return bool(name) and bool(_KOKORO_NAME.match(str(name)))
+
+
+def kokoro_available():
+    if not (KOKORO_MODEL.exists() and KOKORO_VOICES.exists() and shutil.which("afplay")):
+        return False
+    try:
+        import kokoro_onnx  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def download_kokoro():
+    """Download the model files into models/ (~350 MB, once)."""
+    import urllib.request
+    KOKORO_MODEL.parent.mkdir(exist_ok=True)
+    for dst in (KOKORO_MODEL, KOKORO_VOICES):
+        if dst.exists():
+            print(f"{dst.name}: already there")
+            continue
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        print(f"Downloading {dst.name} ...")
+        urllib.request.urlretrieve(KOKORO_URL + dst.name, tmp)
+        tmp.rename(dst)
+    print("Done. The program now speaks with the Kokoro voice.")
+
+
+class _Kokoro:
+    """The model, loaded once per program (in the background) and shared by all Speakers."""
+    _inst = None
+    _make = threading.Lock()
+
+    @classmethod
+    def get(cls):
+        with cls._make:
+            if cls._inst is None:
+                cls._inst = cls()
+            return cls._inst
+
+    def __init__(self):
+        self.ready, self.error, self.kokoro, self.voices = threading.Event(), None, None, set()
+        self.lock = threading.Lock()                        # one synthesis at a time
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self):
+        try:
+            import onnxruntime as ort
+            from kokoro_onnx import Kokoro
+            opts = ort.SessionOptions()
+            opts.log_severity_level = 3
+            sess = ort.InferenceSession(str(KOKORO_MODEL), sess_options=opts, providers=["CPUExecutionProvider"])
+            self.kokoro = Kokoro.from_session(sess, str(KOKORO_VOICES))
+            self.voices = set(self.kokoro.get_voices())
+            self.kokoro.create("Ready.", voice=KOKORO_DEFAULT, speed=1.0, lang="en-us")   # warm up
+            _prune_cache()
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            print(f"  Kokoro voice not available ({self.error}); using the macOS voice.")
+        self.ready.set()
+
+    def synth(self, text, voice, speed):
+        """-> (float32 samples, sample rate) or None."""
+        self.ready.wait()
+        if self.kokoro is None:
+            return None
+        if voice not in self.voices:
+            voice = KOKORO_DEFAULT
+        with self.lock:
+            a, sr = self.kokoro.create(text, voice=voice, speed=speed, lang="en-gb" if voice[0] == "b" else "en-us")
+        return np.asarray(a, np.float32), sr
+
+
+def _prune_cache(keep=3000):
+    if TTS_CACHE.exists():
+        files = sorted(TTS_CACHE.glob("*.wav"), key=lambda f: f.stat().st_mtime)
+        for f in files[:-keep]:
+            f.unlink(missing_ok=True)
+
+
+def _write_wav(path, a, sr):
+    import wave
+    tmp = Path(str(path) + ".part")
+    with wave.open(str(tmp), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes((np.clip(a, -1, 1) * 32767).astype("<i2").tobytes())
+    tmp.replace(path)
+
+
+def split_sentences(text, short=25, long=280):
+    """Text -> pieces spoken one after another: the first sentence starts while the next ones are made.
+    Very short pieces are joined to the next one (each piece costs a little time), very long ones are cut at commas."""
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", str(text).strip()) if p.strip()]
+    out = []
+    for p in parts:
+        while len(p) > long:
+            cut = max(p.rfind(", ", 0, long), p.rfind("; ", 0, long))
+            if cut < 40:
+                break
+            out.append(p[:cut + 1]); p = p[cut + 2:]
+        if out and len(out) > 1 and len(out[-1]) < short:
+            out[-1] = out[-1] + " " + p
+        else:
+            out.append(p)
+    return out
+
+
 class Speaker:
-    """Speech via macOS `say` with the most natural installed English voice. Non-blocking."""
+    """Speech, non-blocking. The neural Kokoro voice when its model is in models/ (natural, offline),
+    otherwise macOS `say` with the best installed English voice.
+    voice: "auto" (Kokoro af_heart, else the best `say` voice), a Kokoro voice (af_heart, af_bella, bf_emma,
+    am_michael, bm_george ...) or a macOS voice name (Samantha, Daniel ...). rate: words per minute (175 = normal)."""
 
     def __init__(self, enabled=True, voice="auto", rate=175):
-        self.voice, self.rate, self.proc = None, rate, None
+        self.voice, self.rate, self.proc, self.engine = None, rate, None, None
         self.enabled = False
+        self._gen, self._worker, self._worker_gen = 0, None, -1
+        self._plock = threading.Lock()
         if not enabled:
             return
+        auto = not voice or voice == "auto"
+        if (auto or is_kokoro_voice(voice)) and kokoro_available():
+            self.engine, self.voice, self.enabled = "kokoro", (KOKORO_DEFAULT if auto else voice), True
+            _Kokoro.get()                                   # starts loading in the background
+            return
+        if is_kokoro_voice(voice):
+            print("  Kokoro model not found (python speech.py --download); using the macOS voice.")
+            voice = "auto"
         if not shutil.which("say"):
             print("  Voice off: the `say` command is not available (not macOS).")
             return
@@ -405,27 +540,109 @@ class Speaker:
                 print("  Voice off: no English voice installed.")
                 return
             self.voice = voices[0][0]
-        self.enabled = True
+        self.engine, self.enabled = "say", True
 
+    @property
+    def speed(self):
+        return float(np.clip(self.rate / 175.0, 0.6, 1.6))
+
+    # --- Kokoro ---
+    def _piece(self, text):
+        """WAV file of one piece of text (from the cache, or made now)."""
+        import hashlib
+        key = hashlib.sha1(f"{self.voice}|{self.speed:.2f}|{text}".encode()).hexdigest()[:24]
+        f = TTS_CACHE / f"{key}.wav"
+        if f.exists():
+            f.touch()
+            return f
+        res = _Kokoro.get().synth(text, self.voice, self.speed)
+        if res is None:
+            return None
+        TTS_CACHE.mkdir(exist_ok=True)
+        _write_wav(f, *res)
+        return f
+
+    def _play(self, text, gen):
+        for piece in split_sentences(text):
+            if gen != self._gen:
+                return
+            f = self._piece(piece)                          # made while the previous piece is playing
+            if f is None:                                   # the model failed: say it with macOS
+                if gen == self._gen and shutil.which("say"):
+                    with self._plock:
+                        self.proc = subprocess.Popen(["say", "-r", str(self.rate), text],
+                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            while self.proc is not None and self.proc.poll() is None:
+                if gen != self._gen:
+                    return
+                time.sleep(0.01)
+            with self._plock:
+                if gen != self._gen:
+                    return
+                self.proc = subprocess.Popen(["afplay", str(f)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # --- the interface used by the program ---
     def speak(self, text):
-        if not self.enabled:
+        if not self.enabled or not str(text).strip():
             return
         self.stop()
-        self.proc = subprocess.Popen(["say", "-v", self.voice, "-r", str(self.rate), text],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.engine == "say":
+            self.proc = subprocess.Popen(["say", "-v", self.voice, "-r", str(self.rate), text],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        gen = self._gen
+        self._worker_gen = gen
+        self._worker = threading.Thread(target=self._play, args=(text, gen), daemon=True)
+        self._worker.start()
 
     def speaking(self):
-        return self.proc is not None and self.proc.poll() is None
+        busy = self._worker is not None and self._worker.is_alive() and self._worker_gen == self._gen
+        return busy or (self.proc is not None and self.proc.poll() is None)
 
     def stop(self):
-        if self.speaking():
-            self.proc.terminate()
-        self.proc = None
+        with self._plock:
+            self._gen += 1
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.terminate()
+            self.proc = None
 
     def to_file(self, text, path):
-        """Render speech to a file (tests, playlist). -> True on success."""
+        """Render speech to a file (tests, playlist; .wav, or .aiff/.m4a via afconvert). -> True on success."""
         if not self.enabled:
             return False
-        r = subprocess.run(["say", "-v", self.voice, "-r", str(self.rate), "-o", str(path), text],
-                           capture_output=True, timeout=60)
-        return r.returncode == 0 and Path(path).exists()
+        path = Path(path)
+        if self.engine == "say":
+            r = subprocess.run(["say", "-v", self.voice, "-r", str(self.rate), "-o", str(path), text],
+                               capture_output=True, timeout=60)
+            return r.returncode == 0 and path.exists()
+        chunks, sr = [], 24000
+        for piece in split_sentences(text):
+            res = _Kokoro.get().synth(piece, self.voice, self.speed)
+            if res is None:
+                return False
+            a, sr = res
+            chunks += [a, np.zeros(int(0.12 * sr), np.float32)]
+        if not chunks:
+            return False
+        wav = path if path.suffix.lower() == ".wav" else path.with_suffix(".tmp.wav")
+        _write_wav(wav, np.concatenate(chunks), sr)
+        if wav != path:
+            fmt = {".aiff": ("AIFF", "BEI16"), ".aif": ("AIFF", "BEI16"), ".m4a": ("m4af", "aac")}.get(path.suffix.lower(), ("AIFF", "BEI16"))
+            r = subprocess.run(["afconvert", "-f", fmt[0], "-d", fmt[1], str(wav), str(path)], capture_output=True)
+            wav.unlink(missing_ok=True)
+            if r.returncode != 0:
+                return False
+        return path.exists()
+
+
+if __name__ == "__main__":
+    import sys
+    if "--download" in sys.argv:
+        download_kokoro()
+    else:
+        sp = Speaker(voice=sys.argv[1] if len(sys.argv) > 1 else "auto")
+        print(f"Voice: {sp.voice} ({sp.engine})")
+        sp.speak("Hello! This is Earth Jukebox. Point at the map and hold your finger still for three seconds.")
+        while sp.speaking():
+            time.sleep(0.1)

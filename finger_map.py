@@ -2805,8 +2805,10 @@ def main():
     ap.add_argument("--no-sound", action="store_true", help="no sonification")
     ap.add_argument("--no-voice", action="store_true", help="do not announce the point by voice")
     ap.add_argument("--voice", default="auto",
-                    help="macOS voice (default: auto = best installed English voice, e.g. Samantha; "
-                         "Premium/Enhanced voices are picked automatically once installed)")
+                    help="voice (default: auto = the neural Kokoro voice af_heart if its model is in models/ - "
+                         "python speech.py --download; otherwise the best installed macOS voice). Kokoro voices: "
+                         "af_heart, af_bella, af_nicole, bf_emma, bf_isabella, am_michael, bm_george ...; "
+                         "or a macOS voice name such as Samantha")
     ap.add_argument("--voice-rate", type=int, default=175, help="speaking rate, words per minute")
     ap.add_argument("--volume", type=float, default=0.8, help="volume 0..1")
     ap.add_argument("--width", type=int, default=1280, help="camera frame width")

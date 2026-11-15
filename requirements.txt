@@ -8,3 +8,4 @@ opencv-python
 scipy
 sounddevice
 pyobjc-framework-AVFoundation; sys_platform == "darwin"
+kokoro-onnx   # natural offline voice; model files: python speech.py --download

@@ -45,3 +45,6 @@ frames/
 
 # --- voice samples ---
 voice_samples/
+
+# --- spoken sentences already made by the Kokoro voice ---
+.tts_cache/

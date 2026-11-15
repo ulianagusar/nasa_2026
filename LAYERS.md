@@ -154,8 +154,13 @@ world region, natural region; or sea/ocean and the nearest country), **the time*
 **the layer name and value**, the comparison with the baseline and the `speech_note`. The layer name is
 the `title` without the explanation in brackets. The place is found offline from the Natural Earth
 outlines (`data/ne_50m_*.geojson`, downloaded automatically) - see [speech.py](speech.py).
-The voice is the best installed English macOS voice (Premium/Enhanced voices are picked first);
-choose another one with `--voice Daniel`.
+The voice is **Kokoro**, a small neural text-to-speech model (82M parameters, Apache 2.0) that runs offline on
+the CPU, about 3× faster than real time on an M2. Its files are not in git; get them once with
+`.venv/bin/python speech.py --download` (~350 MB into `models/`). Long messages are spoken sentence by sentence
+(the first one starts while the next ones are made, ~1 s); every sentence is kept in `.tts_cache/`, so the menu,
+the help and repeated phrases start at once. Other voices: `--voice bf_emma` (British), `af_bella`, `am_michael`,
+`bm_george` ... Without the model the best installed macOS voice is used (`--voice Daniel` picks one).
+Listen to a voice: `.venv/bin/python speech.py bf_emma`.
 The `v` key (or menu item **8. Voice**) turns the spoken messages off and on; the sounds and the chime stay.
 The choice is kept for the menu and the next sessions; `--no-voice` starts with the voice off.
 
