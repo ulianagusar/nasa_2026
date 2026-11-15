@@ -514,6 +514,173 @@ class GlobeTracker:
 
 
 # ----------------------------------------------------------------------------
+# Віртуальний глобус: малюється поверх камери, обертається щипком лівої руки
+# ----------------------------------------------------------------------------
+def _rodrigues(axis_angle):
+    return cv2.Rodrigues(np.asarray(axis_angle, np.float64).reshape(3, 1))[0]
+
+
+class VirtualGlobe:
+    """Глобус, якого немає фізично: куля з даними шару малюється поверх (дзеркального) кадру камери.
+    Права рука показує на нього, ліва обертає: щипок (великий + вказівний) і рух = трекбол, з інерцією.
+    Система огляду: X праворуч, U вгору, Z до глядача; v = R g (g - точка в системі глобуса)."""
+    status, mode, inliers, score = "tracked", "virtual", 0, 1.0
+    PINCH_ON, PINCH_OFF = 0.33, 0.5          # відстань великий-вказівний / розмір долоні
+
+    def __init__(self, frame_wh, radius_frac=0.42, lat0=20.0, lon0=15.0, step=2):
+        self.W, self.H = int(frame_wh[0]), int(frame_wh[1])
+        self.u0, self.v0 = self.W * 0.5, self.H * 0.52
+        self.r = self.H * radius_frac
+        self.step = step
+        self.reset(lat0, lon0)
+        self.coast = [latlon_to_vec(r[::4, 1], r[::4, 0]) for r in land_rings() if len(r) > 20] \
+            if LAND_FILE.exists() else []
+        grat = []
+        for lo in range(-180, 180, 30):
+            la = np.linspace(-85, 85, 60)
+            grat.append(latlon_to_vec(la, np.full_like(la, lo)))
+        for la in range(-60, 61, 30):
+            lo = np.linspace(-180, 180, 120)
+            grat.append(latlon_to_vec(np.full_like(lo, la), lo))
+        self.grat = grat
+        self.pinching, self.last_pt, self.pinch_pt, self.last_t = False, None, None, None
+        self.vel = np.zeros(2)                                   # швидкість перетягування (px/с) для інерції
+        self._grid = None
+
+    # --- орієнтація ---
+    def reset(self, lat0=20.0, lon0=15.0):
+        """Точка (lat0, lon0) у центрі, північ угору."""
+        fwd = latlon_to_vec(lat0, lon0)
+        north = np.array([0, 0, 1.0])
+        up = north - fwd * (north @ fwd); up /= np.linalg.norm(up)
+        self.R = np.stack([np.cross(up, fwd), up, fwd])
+        self.vel = np.zeros(2)
+
+    def north_up(self):
+        """Повернути північ угору, не змінюючи місця в центрі."""
+        lat, lon, _, _ = self.to_latlon(self.u0, self.v0)
+        self.reset(lat, lon)
+
+    def rotate_drag(self, dx, dy):
+        """Перетягування на (dx, dy) пікселів: поверхня рухається за рукою (трекбол)."""
+        d = np.array([dx, -dy], float) / self.r
+        ang = float(np.linalg.norm(d))
+        if ang < 1e-6:
+            return
+        axis = np.array([-d[1], d[0], 0.0]) / ang
+        self.R = _rodrigues(axis * ang) @ self.R
+
+    def resize(self, factor):
+        self.r = float(np.clip(self.r * factor, self.H * 0.2, self.H * 0.49))
+        self._grid = None
+
+    # --- палець -> координати ---
+    def to_latlon(self, px, py):
+        X, U = (px - self.u0) / self.r, (self.v0 - py) / self.r
+        d2 = X * X + U * U
+        if d2 > 1:
+            return 0.0, 0.0, False, 0.0
+        Z = np.sqrt(1 - d2)
+        lat, lon = vec_to_latlon(np.array([X, U, Z]) @ self.R)
+        return float(lat), float(lon), True, float(Z)
+
+    def project(self, G):
+        V = np.asarray(G) @ self.R.T
+        return self.u0 + V[:, 0] * self.r, self.v0 - V[:, 1] * self.r, V[:, 2] > 0
+
+    # --- ліва рука: щипок і рух ---
+    def handle_left(self, lms, w, h, now):
+        dt = 0.0 if self.last_t is None else min(now - self.last_t, 0.2)
+        self.last_t = now
+        if lms is None:
+            self.pinching, self.last_pt, self.pinch_pt = False, None, None
+        else:
+            p = lambda i: np.array([lms[i].x * w, lms[i].y * h])
+            size = max(np.linalg.norm(p(0) - p(9)), 1.0)        # зап'ястя - основа середнього пальця
+            pd = np.linalg.norm(p(4) - p(8)) / size
+            self.pinching = pd < (self.PINCH_OFF if self.pinching else self.PINCH_ON)
+            self.pinch_pt = (p(4) + p(8)) / 2
+            if self.pinching:
+                if self.last_pt is not None:
+                    delta = self.pinch_pt - self.last_pt
+                    self.rotate_drag(*delta)
+                    if dt > 0:
+                        self.vel = 0.6 * self.vel + 0.4 * delta / dt
+                self.last_pt = self.pinch_pt
+                return
+            self.last_pt = None
+        if dt > 0 and np.linalg.norm(self.vel) > 20:             # інерція після відпускання
+            self.rotate_drag(*(self.vel * dt))
+            self.vel *= np.exp(-dt / 0.6)
+        elif dt > 0:
+            self.vel[:] = 0
+
+    # --- малювання ---
+    def _disc(self):
+        if self._grid is None:
+            s = self.step
+            xs = np.arange(-self.r, self.r, s)
+            X, Y = np.meshgrid(xs, xs)
+            X, U = X / self.r, -Y / self.r
+            inside = X ** 2 + U ** 2 < 1
+            Z = np.sqrt(np.clip(1 - X ** 2 - U ** 2, 0, 1))
+            self._grid = (np.stack([X, U, Z], -1), inside, Z, len(xs))
+        return self._grid
+
+    def draw(self, frame, layer=None, t=None, alpha=0.6):
+        V, inside, Z, n = self._disc()
+        G = V[inside] @ self.R                                   # точки диска -> координати на глобусі
+        lat, lon = vec_to_latlon(G)
+        img = np.zeros((n, n, 3), np.uint8)
+        if layer is not None:
+            grid = layer.grid(t)
+            dlat = abs(layer.lat[1] - layer.lat[0]); dlon = abs(layer.lon[1] - layer.lon[0])
+            i = np.clip(np.round((lat - layer.lat[0]) / dlat).astype(int), 0, len(layer.lat) - 1)
+            j = np.round((lon - layer.lon[0]) / dlon).astype(int) % len(layer.lon)
+            val = grid[i, j]
+            nrm = np.clip((val - layer.vmin) / (layer.vmax - layer.vmin), 0, 1)
+            rgb = layer.lut[np.nan_to_num(nrm * 255).astype(int)].astype(float)
+            rgb[np.isnan(val)] = (170, 170, 165)
+        else:
+            land = land_raster()
+            li = np.clip(((90 - lat) / RES).astype(int), 0, land.shape[0] - 1)
+            lj = np.clip(((lon + 180) / RES).astype(int), 0, land.shape[1] - 1)
+            rgb = np.where(land[li, lj][:, None], [[150, 170, 110]], [[60, 120, 185]]).astype(float)
+        rgb *= (0.55 + 0.45 * Z[inside])[:, None]                # об'єм: край кулі темніший
+        img[inside] = np.clip(rgb[:, ::-1], 0, 255).astype(np.uint8)   # RGB -> BGR
+        big = cv2.resize(img, (2 * int(self.r), 2 * int(self.r)), interpolation=cv2.INTER_LINEAR)
+        mask = np.zeros(big.shape[:2], np.uint8)
+        cv2.circle(mask, (int(self.r), int(self.r)), int(self.r) - 1, 255, -1, cv2.LINE_AA)
+        x0, y0 = int(self.u0 - self.r), int(self.v0 - self.r)
+        fx0, fy0 = max(x0, 0), max(y0, 0)
+        fx1, fy1 = min(x0 + big.shape[1], frame.shape[1]), min(y0 + big.shape[0], frame.shape[0])
+        if fx1 > fx0 and fy1 > fy0:
+            sub = frame[fy0:fy1, fx0:fx1].astype(float)
+            b = big[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0].astype(float)
+            a = (mask[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0] / 255.0 * alpha)[..., None]
+            frame[fy0:fy1, fx0:fx1] = (sub * (1 - a) + b * a).astype(np.uint8)
+        for vecs, col, th in ((self.grat, (210, 210, 210), 1), (self.coast, (40, 40, 40), 1)):
+            for Vv in vecs:
+                x, y, vis = self.project(Vv)
+                pts = np.stack([x, y], 1)
+                start = None
+                for k in range(len(vis) + 1):
+                    if k < len(vis) and vis[k]:
+                        start = k if start is None else start
+                    elif start is not None:
+                        if k - start > 1:
+                            cv2.polylines(frame, [np.int32(pts[start:k])], False, col, th, cv2.LINE_AA)
+                        start = None
+        cv2.circle(frame, (int(self.u0), int(self.v0)), int(self.r), (255, 255, 255), 2, cv2.LINE_AA)
+        if self.pinch_pt is not None:                            # де ліва рука: щипок = обертання
+            c = tuple(int(v) for v in self.pinch_pt)
+            col = (191, 106, 37) if self.pinching else (160, 160, 160)
+            cv2.circle(frame, c, 14 if self.pinching else 9, col, -1 if self.pinching else 2, cv2.LINE_AA)
+            cv2.putText(frame, "ROTATE" if self.pinching else "pinch to rotate", (c[0] + 16, c[1] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
+
+
+# ----------------------------------------------------------------------------
 # Пошук обрису кулі в кадрі
 # ----------------------------------------------------------------------------
 def detect_globe_circle(frame):

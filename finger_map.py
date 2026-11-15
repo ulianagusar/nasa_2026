@@ -70,6 +70,11 @@ KEYS = [
     ("k", "клавіша ка", "заново позначити кути карти"),
     ("q", "клавіша кю", "вихід"),
 ]
+# Віртуальний глобус: ліва рука обертає, тож час - клавішами; калібрування немає, є "північ угору" і розмір.
+KEYS_VIRTUAL = [k for k in KEYS if k[0] not in ("c", "k")] + [
+    ("n", "клавіша ен", "повернути глобус північчю вгору"),
+    ("+ -", "плюс і мінус", "більший або менший глобус"),
+]
 # Глобус: часу лівою рукою немає, тож "кома/крапка/p" - головне керування часом; c/k означають інше.
 KEYS_GLOBE = [k for k in KEYS if k[0] not in ("c", "k")] + [
     ("c", "клавіша це", "калібрування глобуса заново"),
@@ -614,6 +619,9 @@ class GlobeSurface:
         self.model, self.tracker = model, tracker
         self.overlay = GB.GlobeOverlay(model)
 
+    def to_latlon(self, px, py):
+        return self.model.to_latlon(px, py)
+
 
 def hands_mask(res, w, h):
     """Маска рук (і передпліччя) для відстеження глобуса: ці пікселі не порівнюються з картою суші."""
@@ -850,7 +858,7 @@ class Panel:
             k = layer.clamp_frame(info["t"])
             d.text((x, y), f"{'дата' if layer.has_dates else 'рік'} {layer.time_label(k)}" + mode, font=self.f["s"],
                    fill=col("cool" if info.get("time_hand") else "ink2")); y += 22
-            how = "ліва рука вздовж карти" if info.get("surface") != "globe" else "період (клавіші)"
+            how = "ліва рука вздовж карти" if info.get("surface", "map") == "map" else "період (клавіші)"
             d.text((x, y), f"{how}: {layer.short_label(0)} ← → {layer.short_label(layer.n_frames - 1)}",
                    font=self.f["xs"], fill=col("muted")); y += 17
             d.text((x, y), f"кадр {k + 1}/{layer.n_frames}   , . ±1   < > ±10   p ▶/❚❚", font=self.f["xs"],
@@ -901,7 +909,9 @@ class Panel:
         if gi is not None and info.get("sheet") == "tracked":
             st = (f"знайдено ({gi['inliers']} точок)" if gi["mode"] == "features" else "за контурами суші")
             st += f" · вивчено {gi['coverage'] * 100:.0f}%"
-        d.text((x, y), f"{'Глобус' if info.get('surface') == 'globe' else 'Карта'}: {st}", font=self.f["xs"],
+        if info.get("surface") == "virtual":
+            st = "віртуальний · щипок лівою = обертання · n північ"
+        d.text((x, y), f"{'Карта' if info.get('surface', 'map') == 'map' else 'Глобус'}: {st}", font=self.f["xs"],
                fill=col("ink2")); y += 18
         snd = "вимкнено (m)" if info.get("muted") else (f"нота {info['note']}" if info.get("note") else "тиша")
         d.text((x, y), f"Звук: {snd}", font=self.f["xs"], fill=col("ink2")); y += 18
@@ -1138,12 +1148,68 @@ def draw_timeline(frame, G, layer, t, active):
                 cv2.LINE_AA)
 
 
+class SpinMeter:
+    """Швидкість обертання глобуса (°/с) за останню ~1 с - а не між сусідніми кадрами,
+    щоб тремтіння оцінки орієнтації (~0.3° на кадр) не виглядало як обертання."""
+
+    def __init__(self, window=1.0):
+        self.window, self.hist, self.speed = window, deque(), 0.0
+
+    def update(self, now, R):
+        self.hist.append((now, np.array(R, float)))
+        while len(self.hist) > 2 and now - self.hist[1][0] >= self.window:
+            self.hist.popleft()
+        t_old, R_old = self.hist[0]
+        if now - t_old >= 0.4:
+            a = np.degrees(np.arccos(np.clip((np.trace(R_old.T @ self.hist[-1][1]) - 1) / 2, -1, 1)))
+            self.speed = a / (now - t_old)
+        return self.speed
+
+
+class Fixation:
+    """Фіксація точки: палець має 3 с "стояти" і на екрані, і на Землі.
+    Відлік скидається, якщо (1) палець зсунувся більше ніж на radius_px, (2) точка Землі під пальцем
+    зсунулася більше, ніж відповідає radius_px у поточному масштабі (карту/глобус посунули чи
+    повернули під нерухомим пальцем), або (3) глобус обертається швидше за spin_limit °/с."""
+
+    def __init__(self, dwell, radius_px, spin_limit=3.0):
+        self.dwell, self.radius_px, self.spin_limit = dwell, radius_px, spin_limit
+        self.reset()
+
+    def reset(self):
+        self.anchor, self.t0, self.fired, self.ll, self.tol = None, 0.0, False, None, None
+
+    def update(self, now, px, ok, lat, lon, latlon_at, spin_speed=0.0):
+        """-> частка відліку 0..1. latlon_at(x, y) -> (lat, lon, ok) для перерахунку допуску в км."""
+        px = np.asarray(px, float)
+        moved_geo = ok and self.ll is not None and self.tol is not None and \
+            float(L.haversine_km(lat, lon, *self.ll)) > self.tol
+        if (self.anchor is None or np.hypot(*(px - self.anchor)) > self.radius_px or moved_geo
+                or spin_speed > self.spin_limit):
+            self.anchor, self.t0, self.fired = px.copy(), now, False
+            self.ll, self.tol = ((lat, lon) if ok else None), None
+            if ok:
+                la2, lo2, ok2 = latlon_at(px[0] + self.radius_px, px[1])
+                if not ok2:
+                    la2, lo2, ok2 = latlon_at(px[0] - self.radius_px, px[1])
+                self.tol = max(float(L.haversine_km(lat, lon, la2, lo2)), 30.0) if ok2 else 300.0
+        return min(1.0, (now - self.t0) / self.dwell)
+
+    def should_fire(self, frac):
+        """True рівно один раз, коли відлік дійшов до кінця."""
+        if frac >= 1.0 and not self.fired:
+            self.fired = True
+            return True
+        return False
+
+
 def run_tracking(cap, cal, specs, args, scale, globe=None):
     mp, landmarker = make_landmarker()
     frame = _read(cap)
-    tracker = make_tracker(args.track, cal, frame.shape) if globe is None else globe.tracker
-    keys = KEYS if globe is None else KEYS_GLOBE
-    surface = "map" if globe is None else "globe"
+    virtual = isinstance(globe, GB.VirtualGlobe)
+    tracker = make_tracker(args.track, cal, frame.shape) if globe is None else (globe if virtual else globe.tracker)
+    keys = KEYS if globe is None else (KEYS_VIRTUAL if virtual else KEYS_GLOBE)
+    surface = "map" if globe is None else ("virtual" if virtual else "globe")
     off_word = "палець поза картою" if globe is None else "палець поза глобусом"
     finger, time_finger = OneEuro(), OneEuro(min_cutoff=0.8)
     son = Sonifier(enabled=not args.no_sound, volume=args.volume)
@@ -1159,6 +1225,8 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     t = layer.frame_at(None if args.year is None else args.year + 0.5)   # індекс кадру шару
     playing, last_step = False, 0.0
     swap = args.swap_hands
+    if virtual:            # дзеркальний кадр: мітки рук MediaPipe тоді правильні, не міняємо їх
+        swap = not swap
 
     print("=== ТРЕКІНГ === Шари даних:")
     for k, s in enumerate(specs, 1):
@@ -1166,6 +1234,11 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     if globe is None:
         print("   ПРАВА рука, вказівний палець: водити по карті.")
         print("   ЛІВА рука, вказівний палець: час - вести вздовж карти (лівий край = перший кадр, правий = останній).")
+    elif virtual:
+        print("   Віртуальний глобус поверх камери (кадр віддзеркалено, як у відеодзвінку).")
+        print("   ПРАВА рука, вказівний палець: показувати на глобус.")
+        print("   ЛІВА рука: звести великий і вказівний пальці (щипок) і вести - глобус обертається; відпустити - зупинка.")
+        print("   Час - клавішами: , . (крок), < > (10 кроків), p (програвання).")
     else:
         print("   ПРАВА рука, вказівний палець: показувати на глобус. Глобус можна крутити, переставляти й нахиляти:")
         print(f"   програма знаходить його за запам'ятованими точками (пам'ять: {len(getattr(tracker, 'memory', []))} точок).")
@@ -1181,7 +1254,18 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     cv2.namedWindow(WIN_CAM, cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow(WIN_SST, cv2.WINDOW_NORMAL)
     placed = False
-    smooth, anchor, anchor_t, fired, last_seen = None, None, 0.0, False, 0.0
+    smooth, last_seen = None, 0.0
+    fix = Fixation(args.dwell, args.radius * max(frame.shape[1], frame.shape[0]))
+    spin, spin_speed = SpinMeter(), 0.0        # швидкість обертання глобуса (°/с)
+
+    def latlon_at(px, py):
+        """Широта/довгота під пікселем на поточній поверхні (карта або глобус)."""
+        if globe is None:
+            uu, vv = apply_H(G, [[px, py]])[0]
+            la, lo, okk = cal.sheet_to_latlon(uu, vv)
+            return la, lo, okk and -0.02 <= uu <= 1.02 and -0.02 <= vv <= 1.02
+        la, lo, hit_, fac_ = globe.to_latlon(px, py)
+        return la, lo, hit_ and fac_ > 0.12
     tsmooth, time_seen = None, 0.0
     trail = deque(maxlen=40)
     last_fix = ""
@@ -1217,6 +1301,8 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
 
     while True:
         frame = _read(cap)
+        if virtual:
+            frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         now = time.monotonic()
         ts = max(int((now - t0) * 1000), last_ts + 1); last_ts = ts
@@ -1227,6 +1313,8 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
         if globe is None:
             corners = tracker.update(frame)
             G = cam_to_sheet_H(corners)
+        elif virtual:                                          # ліва рука: щипок і рух обертають глобус
+            globe.handle_left(roles.get("time"), w, h, now)
         else:                                                  # поворот глобуса; руку не порівнюємо з картою суші
             tracker.update(frame, hands_mask(res, w, h) if res.hand_landmarks else None)
 
@@ -1236,7 +1324,8 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             smooth = finger(np.array([lm.x * w, lm.y * h]), now).copy()
             last_seen = now
         elif now - last_seen > 0.4:  # руку загублено
-            smooth, anchor, fired = None, None, False
+            smooth = None
+            fix.reset()
             finger.reset()
 
         # ---- ліва рука: час ----
@@ -1267,11 +1356,15 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 "inliers": getattr(tracker, "inliers", None), "layer": layer, "layer_idx": li + 1,
                 "n_layers": len(specs), "t": t, "playing": playing, "time_hand": time_hand,
                 "voice": voice.voice if voice.enabled else None, "speaking": voice.speaking(), "surface": surface,
-                "globe": None if globe is None else {"mode": getattr(tracker, "mode", "spin"),
+                "globe": None if globe is None or virtual else {"mode": getattr(tracker, "mode", "spin"),
                                                      "inliers": getattr(tracker, "inliers", 0),
                                                      "coverage": tracker.coverage() if hasattr(tracker, "coverage") else 0}}
         lat = lon = None
         frac = 0.0
+        # швидкість обертання глобуса: поки його крутять, точка під пальцем змінюється - фіксації немає
+        # (рахуємо за ~0.5 с, а не між сусідніми кадрами: тремтіння оцінки орієнтації тоді не накопичується)
+        if globe is not None:
+            spin_speed = spin.update(now, globe.R if virtual else globe.model.R())
         if smooth is not None:
             if globe is None:
                 u, v = apply_H(G, [smooth])[0]
@@ -1279,12 +1372,10 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 lat, lon, ok = cal.sheet_to_latlon(u, v)
                 ok = ok and on_sheet
             else:
-                lat, lon, hit, facing = globe.model.to_latlon(*smooth)
+                lat, lon, hit, facing = globe.to_latlon(*smooth)
                 ok = hit and facing > 0.12                     # самий край кулі - ненадійно
                 info["edge"] = ok and facing < 0.35
-            if anchor is None or np.hypot(*(smooth - anchor)) > args.radius * max(w, h):
-                anchor, anchor_t, fired = smooth.copy(), now, False
-            frac = min(1.0, (now - anchor_t) / args.dwell)
+            frac = fix.update(now, smooth, ok, lat, lon, latlon_at, spin_speed)
             info["dwell"] = frac
             if ok:
                 info.update(state="ok", pos=(lat, lon))
@@ -1292,7 +1383,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             else:
                 info["state"] = "offmap"
                 lat = lon = None
-            col = (12, 163, 12) if fired else (52, 104, 235)
+            col = (12, 163, 12) if fix.fired else (52, 104, 235)
             c = (int(smooth[0]), int(smooth[1]))
             cv2.circle(frame, c, 7, col, -1)
             cv2.ellipse(frame, c, (24, 24), -90, 0, 360 * frac, col, 3)
@@ -1301,8 +1392,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
         s = layer.sample(lat, lon, t) if lat is not None else None
         info["sample"] = s
 
-        if smooth is not None and frac >= 1.0 and not fired:
-            fired = True
+        if smooth is not None and fix.should_fire(frac):
             if s is not None:
                 last_fix = report(layer, t, lat, lon, s)
                 last_spoken = SP.compose(layer, t, lat, lon, s, geo.locate(lat, lon) if geo.ready else None)
@@ -1332,6 +1422,8 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 cv2.circle(frame, (int(p[0]), int(p[1])), 6, qcol[tracker.status], -1)
             if layer.dynamic:
                 draw_timeline(frame, G, layer, t, time_hand)
+        elif virtual:                                          # куля з даними шару, берегові лінії, щипок
+            globe.draw(frame, layer, t)
         else:                                                  # обрис, сітка і берегові лінії: видно, чи збіглося
             globe.overlay.draw(frame, tracker.status)
 
@@ -1388,7 +1480,15 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 playing = not playing
                 last_step = now
                 print("Відтворення кадрів: " + ("▶" if playing else "пауза"))
-        if key == ord("c") and globe is not None:
+        if virtual and key == ord("n"):
+            globe.north_up()
+        if virtual and key in (ord("+"), ord("=")):
+            globe.resize(1.1)
+        if virtual and key in (ord("-"), ord("_")):
+            globe.resize(1 / 1.1)
+        if virtual and key in (ord("c"), ord("k")):
+            pass                                               # віртуальному глобусу калібрування не потрібне
+        elif key == ord("c") and globe is not None:
             son.silence()
             globe = run_globe_calibration(cap, args, scale)
             tracker = globe.tracker
@@ -1396,7 +1496,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
             son.silence()
             cal = run_calibration(cap, args, scale)
             tracker = make_tracker(args.track, cal, frame.shape)
-        if key == ord("k") and globe is not None:
+        if key == ord("k") and globe is not None and not virtual:
             # освітлення змінилось -> заново вивчити кольори "вода/суша" при поточному повороті
             hm = hands_mask(res, w, h) if res.hand_landmarks else None
             tracker.learn_colors(frame, None, hand_mask=hm)
@@ -1404,7 +1504,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
                 tracker.memory.add_from_frame(frame, globe.model, tracker.orb, hm, min_facing=0.6)
             GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)
             print("Кольори глобуса оновлено, поточний бік дозапам'ятовано")
-        elif key == ord("k"):
+        elif key == ord("k") and not virtual:
             # ті самі 4 кути заново (напр. змінилось освітлення) -> новий еталон, калібрування місць лишається
             son.silence()
             corners = pick_corners(cap, scale)
@@ -1417,7 +1517,7 @@ def run_tracking(cap, cal, specs, args, scale, globe=None):
     voice.stop()
     son.close()
     landmarker.close()
-    if globe is not None:
+    if globe is not None and not virtual:
         GB.save_globe(GB.GLOBE_CALIB, globe.model, tracker)       # останнє положення + дозапам'ятовані боки
 
 
@@ -1821,6 +1921,84 @@ def selftest(args):
     print(f"   довідка для глобуса: про глобус, без лівої руки, час клавішами {'OK' if ok_hg else 'FAIL'}")
     ok_all &= ok_c and ok_o and ok_s and ok_f and ok_hg
 
+    print("\n5d) Віртуальний глобус (поверх камери, обертання щипком лівої руки):")
+    vg = GB.VirtualGlobe((1280, 720))
+    c_ = vg.to_latlon(vg.u0, vg.v0)
+    up_ = vg.to_latlon(vg.u0, vg.v0 - vg.r * 0.5)
+    rt_ = vg.to_latlon(vg.u0 + vg.r * 0.5, vg.v0)
+    ok_v = abs(c_[0] - 20) < 1e-6 and abs(c_[1] - 15) < 1e-6 and up_[0] > c_[0] and rt_[1] > c_[1]
+    print(f"   центр {c_[0]:.0f}°N {c_[1]:.0f}°E; вище -> північніше, праворуч -> східніше {'OK' if ok_v else 'FAIL'}")
+    left_ = vg.to_latlon(vg.u0 - vg.r * 0.5, vg.v0)
+    vg.rotate_drag(vg.r * np.arcsin(0.5), 0)
+    c2_ = vg.to_latlon(vg.u0, vg.v0)
+    ok_d = abs(c2_[0] - left_[0]) < 0.1 and abs(c2_[1] - left_[1]) < 0.1
+    print(f"   перетягування праворуч: у центрі те, що було ліворуч {'OK' if ok_d else 'FAIL'}")
+    vg.north_up()
+
+    def vhand(pinch, cx):
+        pts = [NS(x=cx / 1280, y=0.7) for _ in range(21)]
+        pts[0] = NS(x=cx / 1280, y=0.85); pts[9] = NS(x=cx / 1280, y=0.70)
+        pts[4] = NS(x=(cx - (5 if pinch else 60)) / 1280, y=0.6); pts[8] = NS(x=(cx + (5 if pinch else 60)) / 1280, y=0.6)
+        return pts
+    l0 = vg.to_latlon(vg.u0, vg.v0)[1]
+    for k_ in range(10):
+        vg.handle_left(vhand(False, 300 + 20 * k_), 1280, 720, k_ * 0.033)   # рука без щипка: не крутить
+    l1 = vg.to_latlon(vg.u0, vg.v0)[1]
+    for k_ in range(10):
+        vg.handle_left(vhand(True, 300 + 20 * k_), 1280, 720, 1 + k_ * 0.033)
+    l2 = vg.to_latlon(vg.u0, vg.v0)[1]
+    vg.handle_left(vhand(False, 500), 1280, 720, 1.4)
+    for k_ in range(5):
+        vg.handle_left(None, 1280, 720, 1.45 + k_ * 0.05)
+    l3 = vg.to_latlon(vg.u0, vg.v0)[1]
+    ok_p = abs(l1 - l0) < 1e-6 and l2 < l1 - 20 and l3 < l2 - 5
+    print(f"   без щипка не крутиться; щипок і рух -> {l1:.0f}° -> {l2:.0f}°; інерція -> {l3:.0f}° {'OK' if ok_p else 'FAIL'}")
+    two = NS(hand_landmarks=[[NS(x=x_, y=0.5)] * 21 for x_ in (0.2, 0.7)],
+             handedness=[[NS(category_name=c_, score=0.9)] for c_ in ("Left", "Right")])
+    r_m = hand_roles(two, swap=True)                            # дзеркальний кадр: мітки не міняємо
+    ok_r = r_m["time"][0].x == 0.2 and r_m["map"][0].x == 0.7
+    print(f"   дзеркальний кадр: ліва рука = обертання, права = показ {'OK' if ok_r else 'FAIL'}")
+    tl_ = next((l_ for l_ in by.values() if l_.dynamic), next(iter(by.values())))
+    fr_v = np.full((720, 1280, 3), 110, np.uint8)
+    t0_ = time.perf_counter()
+    for _ in range(5):
+        f_ = fr_v.copy(); vg.draw(f_, tl_, tl_.default_frame())
+    dt_v = (time.perf_counter() - t0_) / 5 * 1000
+    cv2.imwrite(str(out / "selftest_virtual_globe.png"), f_)
+    hv = SP.help_announcement(KEYS_VIRTUAL, len(specs), "virtual")
+    ok_hv = "великий і вказівний" in hv and "Клавіша ен" in hv
+    print(f"   малювання {dt_v:.0f} мс/кадр; довідка про щипок і клавішу n {'OK' if ok_hv else 'FAIL'}")
+    ok_all &= ok_v and ok_d and ok_p and ok_r and ok_hv
+
+    print("\n5e) Фіксація не спрацьовує, поки глобус крутять під нерухомим пальцем:")
+    vgf = GB.VirtualGlobe((1280, 720))
+    px_ = np.array([vgf.u0 + 30, vgf.v0 - 20])
+    latlon_v = lambda x, y: (lambda r: (r[0], r[1], r[2]))(vgf.to_latlon(x, y))
+
+    def run_fix(frames, rotate, jitter=0.0, seed=0):
+        """frames кадрів по 1/30 с; rotate(k) -> градусів обертання за кадр. -> скільки разів спрацювало, коли"""
+        rg = np.random.default_rng(seed)
+        fx, sm = Fixation(3.0, 0.02 * 1280), SpinMeter()
+        fires = []
+        for k in range(frames):
+            now = k / 30
+            vgf.rotate_drag(vgf.r * np.radians(rotate(k)), 0)
+            R_seen = vgf.R @ GB._rodrigues(rg.normal(0, np.radians(jitter), 3)) if jitter else vgf.R
+            sp = sm.update(now, R_seen)
+            la, lo, okk, _ = vgf.to_latlon(*px_)
+            if fx.should_fire(fx.update(now, px_, okk, la, lo, latlon_v, sp)):
+                fires.append(round(now, 1))
+        return fires
+    f1 = run_fix(150, lambda k: 10 / 30)                         # 5 с крутимо 10°/с
+    f2 = run_fix(150, lambda k: 2.5 / 30)                        # 5 с повільно 2.5°/с (нижче межі швидкості 3°/с)
+    f3 = run_fix(240, lambda k: 10 / 30 if k < 90 else 0)        # 3 с крутимо, потім палець стоїть
+    f4 = run_fix(150, lambda k: 0, jitter=0.3)                   # нерухомий фізичний глобус з тремтінням оцінки
+    ok_fx = not f1 and not f2 and len(f3) == 1 and f3[0] >= 6.0 and len(f4) == 1 and f4[0] <= 3.3
+    print(f"   крутять 10°/с: спрацювань {len(f1)}; повільно 2.5°/с (ловить географічна перевірка): {len(f2)}")
+    print(f"   крутять 3 с, потім стоп: спрацювало о {f3} с (очікується ≈ 3 + 3 = 6 с)")
+    print(f"   нерухомий глобус із тремтінням оцінки 0.3°/кадр: спрацювало о {f4} с  {'OK' if ok_fx else 'FAIL'}")
+    ok_all &= ok_fx
+
     print("\n6) Сонифікація (синтез без звукової карти):")
     sr = Sonifier.SR
     base_layer = by.get("sst") or next(iter(by.values()))
@@ -1924,8 +2102,9 @@ def main():
     ap.add_argument("--projection", default="equirect", choices=PROJECTIONS,
                     help="проєкція, якщо клацнуто лише 4 місця")
     ap.add_argument("--lon0", type=float, default=0.0, help="центральний меридіан карти, якщо 4 місця")
-    ap.add_argument("--surface", default="map", choices=["map", "globe"],
-                    help="map - паперова карта (як раніше), globe - глобус на підставці з віссю")
+    ap.add_argument("--surface", default="map", choices=["map", "globe", "virtual"],
+                    help="map - паперова карта (як раніше), globe - глобус на підставці з віссю, "
+                         "virtual - віртуальний глобус поверх камери (обертання щипком лівої руки)")
     ap.add_argument("--track", default="features", choices=["features", "contour", "static"],
                     help="як відстежувати карту: features - за малюнком карти (за замовчуванням), "
                          "contour - за краями аркуша, static - карта нерухома")
@@ -1958,6 +2137,9 @@ def main():
     try:
         frame = _read(cap)
         scale = min(1.0, args.view / frame.shape[1])
+        if args.surface == "virtual":                          # нічого не калібруємо: глобус намальований
+            run_tracking(cap, None, specs, args, scale, globe=GB.VirtualGlobe((frame.shape[1], frame.shape[0])))
+            return
         if args.surface == "globe":
             loaded = None if args.recalibrate else GB.load_globe()
             if loaded and tuple(loaded[0].geom.to_dict()["frame_wh"]) != (frame.shape[1], frame.shape[0]):
