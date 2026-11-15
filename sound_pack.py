@@ -15,6 +15,7 @@ A layer uses a set through data/<layer>/jukebox.json: "sound": "<set>" ("note" =
     .venv/bin/python sound_pack.py make fire low.wav mid.mp3 high.m4a --layer temperature
     .venv/bin/python sound_pack.py attach currents_speed water        # a set for a layer
     .venv/bin/python sound_pack.py attach temperature note            # back to notes
+    .venv/bin/python sound_pack.py delete fire                        # maps that used it go back to notes
     .venv/bin/python sound_pack.py list
 """
 import argparse
@@ -222,6 +223,34 @@ def layer_sound(spec_or_layer):
     return None if not snd or snd == "note" else snd
 
 
+def sound_of(layer_name):
+    """Sound set of a layer without loading its data: its jukebox.json, else the built-in setting. None = notes."""
+    ov = L._folder_overrides(L.DATA_DIR / layer_name)
+    snd = ov.get("sound", L.BUILTIN.get(layer_name, {}).get("sound"))
+    return None if not snd or snd == "note" else snd
+
+
+def users(set_name):
+    """Names of the layers that sound with this set."""
+    return [s.name for s in L.discover_layers() if sound_of(s.name) == set_name]
+
+
+def delete_set(name):
+    """Delete a sound set; the maps that used it sound with notes again. The built-in water set is kept.
+    -> names of the layers switched back to notes."""
+    if name == "water":
+        raise ValueError("The water set is built in (ocean currents) and cannot be deleted.")
+    sets = list_sets()
+    if name not in sets:
+        raise ValueError(f"No sound set '{name}'")
+    switched = []
+    for lname in users(name):
+        attach(lname, "note")
+        switched.append(lname)
+    shutil.rmtree(sets[name])
+    return switched
+
+
 def attach(layer_name, set_name):
     """set_name = a set name, "water", or None/"note" for notes."""
     folder = L.DATA_DIR / layer_name
@@ -251,6 +280,8 @@ def _cli():
     m.add_argument("--layer", help="also use it for this layer")
     a_ = sub.add_parser("attach", help="use a set for a layer (note = back to notes)")
     a_.add_argument("layer"); a_.add_argument("set")
+    d_ = sub.add_parser("delete", help="delete a sound set (maps that use it go back to notes)")
+    d_.add_argument("set")
     sub.add_parser("list", help="sound sets and which layers use them")
     a = ap.parse_args()
     if a.cmd == "make":
@@ -265,6 +296,9 @@ def _cli():
     elif a.cmd == "attach":
         attach(a.layer, a.set)
         print(f"Layer {a.layer}: {'notes' if a.set == 'note' else a.set}")
+    elif a.cmd == "delete":
+        switched = delete_set(a.set)
+        print(f"Deleted the sound set '{a.set}'." + (f" Back to notes: {', '.join(switched)}" if switched else ""))
     else:
         print("Sound sets: " + (", ".join(describe_set(n) for n in list_sets()) or "none"))
         for s in L.discover_layers():

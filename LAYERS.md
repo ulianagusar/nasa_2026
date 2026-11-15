@@ -194,11 +194,12 @@ Water is just the first **sound set**. Any layer can get its own: start menu →
 choose the map → choose 1–8 audio files one after another, **from the lowest values to the highest**
 (wav, aiff, mp3, m4a, flac, caf ...) → listen: move the mouse along the colour scale of the map (or ← →) and
 hear the mix change exactly as it will under the finger → Enter. The same page can give a map an existing set
-(e.g. the water) or turn it back to notes. From the terminal:
+(e.g. the water) or turn it back to notes. The last row of the map list, **Delete a sound set**, removes a set with its recordings (after a yes); the maps that used it sound with notes again. The built-in water set cannot be deleted. From the terminal:
 
 ```bash
 .venv/bin/python sound_pack.py make fire calm_fire.wav crackle.m4a blaze.mp3 --layer temperature
 .venv/bin/python sound_pack.py attach temperature note        # back to notes
+.venv/bin/python sound_pack.py delete fire                    # delete a set; its maps go back to notes
 .venv/bin/python sound_pack.py list                           # sets and which layer uses which
 ```
 

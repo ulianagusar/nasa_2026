@@ -25,11 +25,42 @@ _UP = {63232, 2490368, 65362}
 _DOWN = {63233, 2621440, 65364}
 
 
-def current_sound(name):
-    """Sound set of a layer without loading its data: jukebox.json, else the built-in setting."""
-    ov = L._folder_overrides(L.DATA_DIR / name)
-    snd = ov.get("sound", L.BUILTIN.get(name, {}).get("sound"))
-    return None if not snd or snd == "note" else snd
+current_sound = SPK.sound_of
+
+
+def delete_page(specs, voice):
+    """Choose a sound set and delete it (after a yes). -> True if something was deleted."""
+    titles = {s.name: s.title for s in specs}
+    names = [n for n in SPK.list_sets() if n != "water"]
+    if not names:
+        voice.speak("There are no sound sets to delete. The water set is built in.")
+        return False
+    rows = []
+    for n in names:
+        used = [titles.get(u, u) for u in SPK.users(n)]
+        rows.append(f"{SPK.describe_set(n)}  —  " + (f"used by: {', '.join(used)}" if used else "not used by any map"))
+    k = choose_row("Delete a sound set", "The maps that use it will sound with notes again. "
+                   "The built-in water set cannot be deleted.", rows, voice,
+                   "Delete a sound set. Which one? " + " ".join(f"{i + 1}: {r}." for i, r in enumerate(rows[:9])))
+    if k is None:
+        return False
+    name = names[k]
+    used = SPK.users(name)
+    question = f"Delete the sound set '{name}' and its recordings?" + \
+        (f"\n{len(used)} map(s) will sound with notes again." if used else "")
+    voice.speak(f"Delete the sound set {name}? Press Delete to confirm.")
+    if not ask_yes(question, "Delete"):
+        voice.speak("Not deleted.")
+        return False
+    try:
+        switched = SPK.delete_set(name)
+    except ValueError as e:
+        voice.speak(str(e))
+        return False
+    voice.speak(f"Deleted {name}." + (" " + ", ".join(titles.get(u, u) for u in switched) +
+                                       " sound with notes again." if switched else ""))
+    print(f"Deleted the sound set '{name}'" + (f"; back to notes: {', '.join(switched)}" if switched else ""))
+    return True
 
 
 def _page(title, subtitle=""):
@@ -240,12 +271,19 @@ def run(voice, sound=True, volume=0.8):
         specs = L.discover_layers()
         while True:
             rows = [f"{s.title}  —  {current_sound(s.name) or 'notes'}" for s in specs]
+            can_delete = any(n != "water" for n in SPK.list_sets())
+            if can_delete:
+                rows.append("Delete a sound set …")
             k = choose_row("Sounds for a map: which map?", "Now: what every map sounds like", rows, voice,
                            "Sounds for a map. Which map should get new sounds? " +
                            " ".join(f"{i + 1}: {s.title}, now {current_sound(s.name) or 'notes'}."
-                                    for i, s in enumerate(specs[:9])))
+                                    for i, s in enumerate(specs[:9])) +
+                           (f" {len(specs) + 1}: delete a sound set." if can_delete and len(specs) < 9 else ""))
             if k is None:
                 return changed
+            if k == len(specs):                                # the last row: delete a set
+                changed |= delete_page(specs, voice)
+                continue
             spec = specs[k]
             layer = spec.load()
             sets = SPK.list_sets()
